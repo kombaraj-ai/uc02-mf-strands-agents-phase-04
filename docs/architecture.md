@@ -1,0 +1,825 @@
+# Architecture
+
+**AMC RFP & Portfolio Insight Orchestrator — Phase 01 (DEV) + Phase 02 (AWS deployment) + Phase 03 (CI/CD)**
+
+This document describes the system as actually implemented in `src/amc_orchestrator/` (Phase 01),
+the AWS infrastructure that runs it in the cloud, as actually implemented in
+`infra/terraform/` (Phase 02), and the GitHub Actions pipeline that builds and deploys it
+(Phase 03 — `.github/workflows/` + `infra/terraform/github-oidc/`). For day-to-day operational
+notes (how to resume work, known flakiness, milestone status), see [`CLAUDE.md`](../CLAUDE.md) at
+the repo root — that file is a working log; this one is the stable reference.
+
+## The problem
+
+Institutional investors and wealth managers send AMCs (Asset Management Companies) RFPs and
+portfolio queries that require synthesizing three things that normally live in disjointed
+systems: exact quantitative fund metrics, qualitative fund-manager narrative, and strict
+regulatory compliance review — a process that manually takes days. This system automates that
+synthesis end-to-end, with a self-correcting compliance loop instead of a single-pass pipeline,
+so a non-compliant draft gets revised and re-checked automatically rather than escaping to the
+client.
+
+## High-level flow
+
+Five agents run as nodes in a [Strands Agents](https://strandsagents.com) `Graph`:
+
+```
+quant_data_pull ──┬───────────────────────────────────┬─────────────┐
+                   │                                     │             │
+qual_narrative_pull┴──► compliance_check ──(needs_revision)──► revise_draft
+                   │           │                                       │
+                   │           └──(ready_to_synthesize)──► final_synthesis
+                   │                                       ▲           ▲
+                   └───────────────────────────────────────┴───────────┘
+                          (quant + qual also feed revise_draft/
+                           final_synthesis directly as grounding)
+
+                   revise_draft ──(unconditional loop-back)──► compliance_check
+```
+
+`quant_data_pull` and `qual_narrative_pull` are the graph's entry points and run in parallel.
+Everything downstream is gated by `compliance_check`'s verdict via the condition functions in
+`workflows/routing.py`.
+
+## The five agents
+
+| Node name             | Module                          | Role                                                              | Temp |
+|------------------------|----------------------------------|---------------------------------------------------------------------|------|
+| `quant_data_pull`      | `agents/quant_agent.py`         | Pulls exact fund metrics via the `get_fund_performance` tool.       | 0.2  |
+| `qual_narrative_pull`  | `agents/qual_agent.py`          | Retrieves manager commentary via the `search_fund_commentary` tool (RAG). | 0.2  |
+| `compliance_check`     | `agents/compliance_agent.py`    | LLM-as-a-Judge; scores the draft against the compliance rubric, returns a structured `ComplianceVerdict`. | 0.15 |
+| `revise_draft`         | `agents/revisor_agent.py`       | Rewrites a REJECTED draft per the verdict's `suggested_edits` — never touches the numbers. | 0.2  |
+| `final_synthesis`      | `agents/synthesizer_agent.py`   | Produces the final client-facing text — two branches, never blended. | 0.4  |
+
+Temperatures are deliberately low for the judge/workers (consistency, less-flaky output) and
+higher for the synthesizer (prose quality). All temperatures are configurable via `Settings`
+(see [`user_guide.md`](user_guide.md)).
+
+### `compliance_check`: LLM-as-a-Judge
+
+Rather than a free-text critique, the compliance agent is built with
+`Agent(structured_output_model=ComplianceVerdict)` (`schemas/compliance.py`):
+
+```python
+class ComplianceVerdict(BaseModel):
+    status: Literal["APPROVED", "REJECTED"]
+    violations: list[str]
+    suggested_edits: str
+    evaluated_text: str  # verbatim echo of the exact text judged
+```
+
+`evaluated_text` is a **mechanical copy task, not a summarization task** — on the first pass the
+agent synthesizes a draft from quant+qual and judges that; on a re-check it judges the Revisor's
+latest rewrite verbatim. Echoing the judged text back lets `final_synthesis` use the exact
+compliant wording on the APPROVED path without having to reconstruct it, and lets `revise_draft`
+know precisely what it's revising on the REJECTED path.
+
+The rubric itself lives in one place, `config/compliance_rubric.py`, and is rendered into both
+the agent's system prompt and [`compliance_rubric.md`](compliance_rubric.md) so they can't drift
+apart. See that file for the five rules (no guarantees, mandatory past-performance disclaimer,
+promissory-language flags, forward-looking-statement framing, risk contextualization).
+
+### `final_synthesis`: two branches, never blended
+
+The synthesizer's system prompt is explicit that it must check the compliance verdict's `status`
+field exactly and pick one of exactly two branches:
+
+- **APPROVED** → a full, structured client report (Quantitative Risk & Performance Metrics /
+  Manager Strategy Commentary / Compliance Disclosures sections), built only from data already
+  present in its context.
+- **Anything else** (REJECTED, or a missing/malformed verdict) → respond with **exactly** the
+  text of `ESCALATION_HOLDING_MESSAGE` (`config/messages.py`) and nothing else — no partial
+  report, no meta-commentary.
+
+This is the system's core safety invariant: unapproved content must never reach a client framed
+as if it were compliant.
+
+## Graph wiring (`workflows/graph_build.py`, `workflows/routing.py`)
+
+Every downstream consumer gets a **direct edge** to the actual source of the data it needs
+(quant, qual) rather than chaining through an intermediary, so `revise_draft` and
+`final_synthesis` always have raw grounding straight from source — never a paraphrase —
+regardless of how many times the compliance loop has run.
+
+```python
+builder.add_edge(quant, compliance)                                   # unconditional
+builder.add_edge(qual, compliance)                                    # unconditional
+builder.add_edge(quant, revisor, condition=needs_revision)
+builder.add_edge(qual, revisor, condition=needs_revision)
+builder.add_edge(compliance, revisor, condition=needs_revision)
+builder.add_edge(quant, synthesizer, condition=ready_to_synthesize)
+builder.add_edge(qual, synthesizer, condition=ready_to_synthesize)
+builder.add_edge(compliance, synthesizer, condition=ready_to_synthesize)
+builder.add_edge(revisor, compliance)                                  # unconditional loop-back
+```
+
+`needs_revision`/`ready_to_synthesize` (`workflows/routing.py`) count how many times
+`compliance_check` has appeared in `state.execution_order` and inspect the latest
+`ComplianceVerdict`:
+
+- `needs_revision`: `False` if compliance hasn't run yet, `False` if `attempts >= max_attempts`,
+  otherwise `True` iff the verdict is missing or `REJECTED`.
+- `ready_to_synthesize`: `False` if compliance hasn't run yet, otherwise `not needs_revision`.
+
+**Why all three incoming edges into `revise_draft`/`final_synthesis` share the same condition
+function** (this was a real bug, found empirically): Strands' `Graph._is_node_ready_with_conditions`
+schedules a node as soon as **any one** incoming edge from the just-completed batch is
+satisfied — OR-semantics, not AND. `quant_data_pull`/`qual_narrative_pull` complete in the very
+first batch. If their edges into `revise_draft`/`final_synthesis` were unconditional ("for
+grounding"), those nodes would become ready immediately, running in parallel with
+`compliance_check`'s *first* pass, before any verdict exists. The fix: every edge into those two
+nodes — from quant, qual, *and* compliance — carries the identical condition function, and that
+function short-circuits to `False` whenever `compliance_check` has not executed even once
+(`attempts == 0`). Caught via a CLI run that showed all three nodes starting within ~1 second of
+each other; see `routing.py`'s and `graph_build.py`'s module docstrings for the full account —
+**do not simplify this back to per-edge conditions without re-reading them.**
+
+## Termination — two layers
+
+1. **Graceful (primary)**: `MAX_COMPLIANCE_ATTEMPTS` (default 3, `Settings.max_compliance_attempts`).
+   Once `compliance_check` has run this many times, `needs_revision` forces `False` and
+   `ready_to_synthesize` forces `True` — control routes to `final_synthesis` **even if the
+   verdict is still REJECTED**, which then emits the escalation message per its second branch.
+2. **Hard safety net**: `GraphBuilder.set_max_node_executions(settings.graph_max_node_executions)`
+   (default 12). If this actually fires, the **whole graph fails with no output at all** — a
+   Strands SDK requirement for cyclic graphs, not a design choice. The graceful layer must always
+   resolve first; the hard ceiling exists only as a backstop against a routing-logic bug, not as
+   a normal exit path.
+
+`reset_on_revisit(True)` is set so `compliance_check` (and any node) starts with a clean executor
+state on each re-entry, meaning each re-evaluation judges the current draft fresh rather than
+accumulating conversation history across loop iterations.
+
+## Known limitation: `StructuredOutputException` on `compliance_check`
+
+`qwen2.5:7b-instruct` on Ollama occasionally fails to invoke its structured-output tool even
+after Strands "forces" it. Strands node execution is fail-fast, so this exception propagates all
+the way out of `graph(...)` as a raw Python exception, not a `FAILED` `GraphResult`.
+
+**Two layers of mitigation, in order:**
+
+1. **`_RetryingComplianceAgent`** (`agents/compliance_agent.py`) — a manual retry that, on
+   `StructuredOutputException`, rolls the agent's conversation back to a clean slate and re-sends
+   the same input, up to `Settings.compliance_structured_output_max_attempts` (default 3) total
+   attempts, before letting the exception propagate.
+2. **Graph-level try/except** — both `cli.py` and `api/routes/rfp.py` wrap `graph(question)` and
+   call `workflows.result_extraction.summarize_exception(exc)` on failure, degrading to the same
+   `ESCALATION_HOLDING_MESSAGE` a REJECTED-after-retries verdict would produce. Callers never see
+   a raw exception or a 500.
+
+**Root cause**: Strands "forces" the structured-output tool via `tool_choice`. Ollama's Strands
+model integration (`strands/models/ollama.py`) explicitly does not support `tool_choice` and
+silently ignores it (`UserWarning: A ToolChoice was provided to this provider but is not
+supported and will be ignored`) — so on this DEV stack, "forcing" never actually forces
+anything; only a generic text nudge remains as leverage, and the model is free to ignore that
+too. This was confirmed to fail 3/3 attempts in one live run even with the retry above in place.
+**This is treated as a known, parked DEV-only limitation**, not something actively being chased
+further — `BedrockModel` (STAGING/PROD) supports real `tool_choice` forcing, so this exact
+failure mode is expected to be far rarer there. See `CLAUDE.md`'s "Bug #2" section for the full
+investigation log.
+
+## Data layer
+
+Two plain, Strands-free modules — unit-testable without an LLM, and shaped so a later
+STAGING/PROD swap only needs to preserve their function signatures:
+
+- **`data/sqlite_store.py`** — `fund_performance` table (ticker, fund_name, fund_category, nav,
+  alpha, beta, sharpe_ratio, standard_deviation, sortino_ratio, r_squared, returns_1y,
+  returns_3y). `ensure_seeded()` is insert-if-missing against a persistent file (not
+  delete-and-recreate), safe to call from the CLI, the API's `lifespan`, and tests alike. Four
+  mock funds are seeded — see [`user_guide.md`](user_guide.md) for the full data.
+- **`data/chroma_store.py`** — a persistent on-disk ChromaDB collection of fund-manager
+  commentary, seeded with deterministic IDs (`ensure_seeded()` upserts, never duplicates).
+  `search_commentary()` does a vector similarity query.
+
+Both are wrapped by thin `@tool`-decorated functions (`tools/quant_tools.py`,
+`tools/qual_tools.py`) that agents call — the wrappers add nothing but the tool boundary, so all
+real logic stays unit-tested at the data-layer level.
+
+## Model provider abstraction
+
+`config/model_factory.py` is the **only** module that imports a concrete Strands model class:
+
+```python
+def get_model(settings: Settings, *, temperature: float) -> Model:
+    if settings.effective_model_provider == "ollama":
+        return OllamaModel(host=settings.ollama_host, model_id=settings.ollama_model_id, temperature=temperature)
+    return BedrockModel(model_id=settings.bedrock_model_id, region_name=settings.aws_region, temperature=temperature)
+```
+
+Every agent constructor calls `get_model(settings, temperature=...)` and never imports
+`OllamaModel`/`BedrockModel` directly, so switching provider is always a config change, never a
+code change to any agent.
+
+**Provider selection is a separate axis from `environment`.** `Settings.model_provider`
+(`"ollama"` | `"bedrock"`, default `"ollama"`) is the developer-facing switch; `environment`
+still selects which `.env.<environment>` file loads. `Settings.effective_model_provider`
+resolves the two:
+
+```python
+@property
+def effective_model_provider(self) -> Literal["ollama", "bedrock"]:
+    if self.environment != "dev":
+        return "bedrock"          # STAGING/PROD: compliance requirement, not a preference
+    return self.model_provider    # DEV: respects the developer's choice
+```
+
+DEV defaults to Ollama (free, fully local) but can opt into Bedrock per-run
+(`MODEL_PROVIDER=bedrock` + AWS credentials) for use cases where CPU-only local generation is
+too slow - without needing a separate environment or any code change. STAGING/PROD always use
+Bedrock regardless of `model_provider`, since that constraint is about where the system is
+deployed, not a runtime preference. See [`user_guide.md`](user_guide.md) for how to switch it.
+
+## Observability
+
+- **`observability/logging_setup.py`** — structlog configured once per process
+  (`configure_logging`), JSON renderer in non-dev environments, a human-friendly console
+  renderer in dev. `bind_trace_context()`/`clear_trace_context()` thread a `trace_id`/`request_id`
+  pair through `contextvars` so every log line for one request — across every agent and tool call
+  — carries the same correlation IDs, without any agent code having to pass them explicitly.
+- **`observability/hooks.py`** — `LoggingHookProvider`, attached to every agent, logs
+  invocation-start/-complete and tool-call-start/-complete as structured events, purely via
+  Strands hooks (`BeforeInvocationEvent`, `AfterInvocationEvent`, `BeforeToolCallEvent`,
+  `AfterToolCallEvent`) — zero business-logic changes required to get per-node timing and
+  tool-call visibility.
+
+## API layer (Milestone 8)
+
+`api/main.py` builds the FastAPI app via `create_app()`: `lifespan` (not the deprecated
+`@app.on_event`) seeds SQLite/Chroma on startup, CORS is read from
+`settings.cors_origin_list`, `GET /health` reports liveness, and `GET /health/ready` reports
+readiness (see below). `api/routes/rfp.py` exposes `POST /api/v1/rfp`, applying the **exact
+same** try/except → `summarize_exception()` pattern as `cli.py` — this is deliberate, not
+incidental: without it, a flaky `compliance_check` would surface to HTTP callers as an unhandled
+500 instead of the intended graceful escalation. See [`user_guide.md`](user_guide.md) for
+request/response shapes and examples.
+
+### Readiness vs. liveness (Milestone 10)
+
+`GET /health` only answers "is the process alive" — it always returns 200. `GET /health/ready`
+(`observability/readiness.py`) answers the more useful operational question, "can this process
+currently serve a request": whether Ollama is reachable over TCP
+(`settings.ollama_host`) **only when `effective_model_provider == "ollama"`** — this check is
+skipped entirely when Bedrock is the active provider, in DEV or otherwise, since pinging a local
+Ollama port would be meaningless there; and in every environment, whether the SQLite/Chroma data
+directories are writable. It returns `200 {"ready": true, ...}` when every check passes, `503 {"ready": false,
+...}` otherwise — an orchestrator should route traffic away from an instance failing readiness,
+distinct from `/health`, which should keep reporting the process itself is fine. The Ollama
+reachability check is also reused (not duplicated) by
+`tests/integration/conftest.py` to auto-skip integration tests when Ollama isn't up.
+
+## Result translation (`workflows/result_extraction.py`)
+
+Both the CLI and the API need to translate Strands' internal `GraphResult` shape (`NodeResult`
+wrapping `AgentResult`, `execution_order` as `GraphNode` objects, etc.) into something
+caller-friendly. `RfpOutcome` (a frozen dataclass) is that shared translation target:
+
+```python
+@dataclass(frozen=True)
+class RfpOutcome:
+    succeeded: bool
+    response_text: str
+    compliance_attempts: int
+    escalated: bool
+    graph_status: str
+```
+
+`summarize_result(result)` builds this from a real `GraphResult`; `summarize_exception(exc)`
+builds the safe-escalation equivalent when `graph(...)` raised outright. Both `cli.py` and
+`api/routes/rfp.py` call whichever applies and never touch Strands-internal types directly.
+
+## Phase 02 — AWS deployment infrastructure
+
+Everything above describes the application as it runs today (DEV, local-first). Phase 02 adds
+the AWS infrastructure to run it on **Amazon Bedrock AgentCore** instead — provisioned entirely
+by modular Terraform under `infra/terraform/`, one root module per environment
+(`environments/{dev,staging,prod}/`), zero manual console steps. Full operational detail (exact
+apply commands, variable reference, troubleshooting) lives in
+[`infra/terraform/README.md`](../infra/terraform/README.md); this section covers the shape of it
+and why it's built this way, in the same spirit as the rest of this document.
+
+**This phase is infra-only.** It provisions AWS resources; it does not change any code under
+`src/amc_orchestrator/`. The app still runs exactly as described above (SQLite/Chroma,
+`sqlite_store.py`/`chroma_store.py`) until a separate, not-yet-started follow-on task builds an
+AgentCore-compliant entrypoint, swaps the data layer to the resources below, and containerizes
+the app for ECR.
+
+### What gets provisioned
+
+| Concern | Resource(s) | Module |
+|---|---|---|
+| Agent execution | `aws_bedrockagentcore_agent_runtime` (container-based, `PUBLIC` network mode) | `agentcore-runtime` |
+| Tool exposure | `aws_bedrockagentcore_gateway` + one `gateway_target` per tool, IAM-auth'd | `agentcore-gateway` |
+| Conversation memory | `aws_bedrockagentcore_memory` + a semantic strategy scoped per session | `agentcore-memory` |
+| Quant metrics | DynamoDB, `PAY_PER_REQUEST`, `ticker` as the sole key — mirrors `sqlite_store.py`'s schema | `dynamodb` |
+| Qual vector store | OpenSearch Serverless collection (`VECTORSEARCH`) + its security/access policies (staging/prod always; dev's default) — or, dev-only, an S3 Vectors bucket + index (`vector_store_backend = "s3_vectors"`, see below) | `opensearch-serverless`, `opensearch-access-policy`, `opensearch-index` — or `s3-vectors` |
+| Qual RAG | Bedrock Knowledge Base + S3 data source, backed by whichever vector store above is selected | `knowledge-base`, `s3-kb-docs` |
+| Ingestion automation | S3 event → SQS (batches ~5 min) → Lambda → `bedrock-agent:StartIngestionJob`, DLQ + alarm on genuine failure — see below | `kb-ingestion-sync` |
+| Tool compute | Stub Lambda functions behind the Gateway targets (placeholder logic — see below) | `lambda-tools` |
+| Container registry | ECR repo for the runtime's image (Terraform never builds/pushes into it) | `ecr` |
+| Access control | One IAM role per AWS-service consumer (runtime, gateway, lambda, knowledge base) | `iam` |
+| Observability | Log groups, a CloudWatch dashboard, Lambda-error/DynamoDB-throttle alarms | `observability` |
+
+### Three architectural decisions worth knowing before touching this code
+
+1. **`PUBLIC` network mode, not `VPC`.** `aws_bedrockagentcore_agent_runtime` in `VPC` mode
+   creates ENIs that AWS locks with an "agentic_ai" owner and never releases, so
+   `terraform destroy` hangs forever on the resulting VPC/subnet/ENI cycle — a confirmed,
+   AWS-side, "not planned" limitation
+   ([terraform-provider-aws#45099](https://github.com/hashicorp/terraform-provider-aws/issues/45099)),
+   not something a smarter Terraform config can route around. Every module here uses `PUBLIC`
+   instead; access to DynamoDB/OpenSearch is scoped by IAM and the OpenSearch data-access policy,
+   not network isolation. This mirrors how `effective_model_provider` elsewhere in this system
+   is a deliberate, documented trade-off rather than an unexamined default — see "Model provider
+   abstraction" above for the same pattern applied to a different decision.
+2. **The vector index is created by a second Terraform provider, in a second apply pass.**
+   `hashicorp/aws` has no resource for an OpenSearch Serverless *index* (only the collection and
+   its policies) — confirmed against AWS's own Terraform deployment walkthrough for OpenSearch
+   Serverless, which stops at the collection. `modules/opensearch-index` uses the
+   `opensearch-project/opensearch` community provider instead, signed specifically for AOSS
+   (`aws_signature_service = "aoss"`, not the provider's `"es"` default), against the collection's
+   real endpoint — which only exists after a first apply. `modules/knowledge-base` depends on that
+   index existing too (the Bedrock Knowledge Base resource references it by name, it doesn't
+   create it). Both are gated behind `enable_knowledge_base` (default `false`) for exactly this
+   reason — see the README's "three phases" section.
+3. **`modules/iam` and the OpenSearch data-access policy would otherwise form a cycle.** IAM's
+   role policies need the collection's ARN to scope their `aoss:*` statements; the collection's
+   data-access policy needs those same roles' ARNs as its `Principal` list. Resolved by splitting
+   the access policy into its own `modules/opensearch-access-policy`, applied after both `iam` and
+   `opensearch-serverless` — a deliberate module boundary, not an accident of ordering.
+
+### Dev-only vector store choice: OpenSearch Serverless vs. S3 Vectors
+
+`environments/dev/variables.tf`'s `vector_store_backend` (`"opensearch"` default, or
+`"s3_vectors"`) lets dev opt into Amazon S3 Vectors — a much cheaper, natively
+Terraform-manageable vector store (`aws_s3vectors_vector_bucket`/`aws_s3vectors_index`,
+`modules/s3-vectors`) — as an alternative to the OpenSearch-index/Knowledge-Base-storage path
+above, without touching the OpenSearch modules themselves. `environments/staging`/`environments/prod`
+hard-lock this variable to `"opensearch"` (a `validation` block, not a silent override — see
+below) since that's the right choice for production traffic.
+
+**Full collection-level gating**: choosing `"s3_vectors"` in dev creates zero OpenSearch
+resources — `modules/opensearch-index`, the Knowledge Base's `storage_configuration` block (via
+`dynamic` blocks in `modules/knowledge-base/main.tf`), the OpenSearch Serverless collection
+itself (`modules/opensearch-serverless`), and its access policy
+(`modules/opensearch-access-policy`) are all backend-conditional. The conditionality for the
+latter two lives *inside* each module via a new `enabled` variable rather than `count` on the
+module block at the root call site — this keeps `module.opensearch_serverless.collection_endpoint`
+a plain, always-resolvable singleton-module attribute reference everywhere it's consumed
+(the `opensearch` Terraform provider block, root `outputs.tf`, `modules/lambda-tools`' endpoint
+input — none of which needed any changes), rather than a `[0]`-indexed one, which HashiCorp's own
+docs confirm provider-block arguments generally can't depend on. `modules/iam` gained the same
+`dynamic "statement"` treatment already used for `S3VectorsDataPlane` in all **three** files that
+reference the collection's ARN (`knowledge_base_role.tf`, `lambda_execution_role.tf`,
+`runtime_role.tf`, not just the first one) — a real gap the naive single-file fix would have
+missed, since AWS rejects an IAM policy statement with an empty-string ARN resource. Both modules
+also gained explicit `moved` blocks (`modules/opensearch-serverless/moved.tf`,
+`modules/opensearch-access-policy/moved.tf`) so adding `count` to previously-uncounted resources
+is a state rename, not a destroy+recreate, on any environment that already had them applied —
+verified via `grep` that no `moved` blocks existed anywhere in this Terraform tree before this
+change. See `infra/terraform/README.md`'s "Pass 1" section for the operational side of this.
+
+**Why a `validation` block in staging/prod, not a silent `effective_*` override**: unlike
+`Settings.effective_model_provider`/`effective_data_backend` (app-layer, DEV-respects/
+STAGING-PROD-forces), an infra operator who explicitly sets `vector_store_backend = "s3_vectors"`
+in `staging/terraform.tfvars` and gets silently overridden back to OpenSearch would have no way
+to know their intent was ignored — a loud `terraform plan` validation error is the safer failure
+mode at this layer.
+
+**The exact `s3vectors:*` IAM action names were wrong on the first real apply, and are now
+fixed and verified.** `modules/iam/knowledge_base_role.tf`'s `S3VectorsDataPlane` statement
+originally guessed singular action names (`GetVector`/`PutVector`/`DeleteVector`) from a
+third-party reference — a real dev apply failed with `AccessDenied` on `s3vectors:GetVectors`
+(the Bedrock Knowledge Base service reads from the index at creation time, not just during later
+ingestion), revealing the real actions are plural (`GetVectors`/`PutVectors`/`DeleteVectors`),
+matching `QueryVectors`/`ListVectors` which were already correct. Fixed and confirmed against
+AWS's own IAM policy examples
+(`docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-iam-policies.html`), not a blog post —
+consistent with this project's own M0 precedent. The same apply also confirmed
+`modules/s3-vectors/variables.tf`'s `data_type`/`distance_metric` defaults (`"float32"`/
+`"cosine"`) work — the vector bucket and index were created successfully before the IAM issue
+surfaced on the Knowledge Base resource specifically.
+
+### Auto-sync ingestion: S3 events to Bedrock Knowledge Base
+
+Added after the initial Phase 02 build, once it became clear that requiring a manual
+`start-ingestion-job` call after every single document change (see "Enabling the Knowledge Base
+and ingesting documents" in [`user_guide.md`](user_guide.md)) didn't scale past the first
+one-off ingestion. `modules/kb-ingestion-sync`, created alongside `modules/knowledge-base` in the
+same Pass 2 (`enable_knowledge_base = true`, no separate flag), closes that gap for every upload
+or deletion *after* the first:
+
+```
+S3 docs bucket ──(ObjectCreated:*/ObjectRemoved:*)──► SQS queue
+                                                            │
+                                        aws_lambda_event_source_mapping
+                                        (batch_size=10, maximum_batching_window_in_seconds=300)
+                                                            ▼
+                                        Lambda: kb-ingestion-sync (Python 3.13)
+                                        boto3 bedrock-agent.start_ingestion_job(...)
+                                                            │
+                                        (3 failed attempts → redrive_policy)
+                                                            ▼
+                                                    SQS DLQ ──► CloudWatch alarm ──► existing
+                                                                                     modules/observability
+                                                                                     SNS topic
+```
+
+Three decisions worth knowing, each surfaced as an explicit choice rather than picked silently
+(this project's standing convention for infra work):
+
+1. **Batching uses only the Lambda event-source-mapping's `maximum_batching_window_in_seconds`
+   (AWS-native)**, not an additional SQS-level `delay_seconds` some reference implementations of
+   this pattern also set — the two would overlap in effect, and the event-source-mapping window is
+   the mechanism AWS purpose-built for exactly this "debounce many events into one invocation"
+   case. This matters because Bedrock only allows **one running ingestion job per data source at a
+   time** — without batching, N rapid S3 events would fire N concurrent `StartIngestionJob` calls,
+   most of which would fail with `ConflictException`. The handler
+   (`modules/kb-ingestion-sync/sync_src/handler.py`) treats that specific exception as a success
+   anyway (ingestion is incremental — a job already in flight will pick up the files that triggered
+   the *next* invocation too), so the batching window is a cost/latency optimization on top of an
+   already-correct fallback, not the only thing standing between this and duplicate-job errors.
+2. **`bedrock:StartIngestionJob` is wildcarded to `knowledge-base/*`, not scoped to the one real KB
+   ARN** (`modules/iam/kb_ingestion_sync_role.tf`). The real ARN doesn't exist until Pass 2
+   (`module.knowledge_base`), but this role is created in Pass 1 (`modules/iam`) — scoping it
+   precisely would recreate the exact `iam`↔`knowledge_base` module cycle already solved once for
+   OpenSearch's access policy (see decision 3 under "Three architectural decisions" above).
+   Accepted, user-confirmed trade-off: this grants the ability to *trigger* ingestion jobs
+   account-wide, not read/write Knowledge Base content. The role's SQS permissions instead use the
+   *predictable-ARN-by-naming-convention* precedent already established by
+   `lambda_execution_role.tf`'s `CloudWatchLogsOwnFunctions` statement, avoiding a second cycle
+   without wildcarding anything SQS-related.
+3. **DLQ failures alert through the existing shared `aws_sns_topic.alarms` in
+   `modules/observability`**, not a new topic — one CloudWatch alarm
+   (`kb_ingestion_dlq_depth`, gated on `var.kb_ingestion_dlq_name != ""`) added alongside the
+   pre-existing Lambda-error/DynamoDB-throttle alarms, so there's one place to subscribe
+   (`var.alarm_email`) rather than a second topic to remember.
+
+**Live-verified end-to-end, 2026-07-13** (not just `validate`/`plan`-clean): applied to real AWS
+and exercised through a full round trip, no manual `start-ingestion-job` call made for any of it —
+uploading a file triggered an automatic ingestion job (`numberOfNewDocumentsIndexed: 1`), deleting
+it triggered another that correctly removed the corresponding vector (`numberOfDocumentsDeleted:
+1`, confirmed absent from a subsequent `Retrieve` call), and re-uploading it restored the vector
+(`numberOfNewDocumentsIndexed: 1` again). One real bug found and fixed along the way:
+`modules/iam/kb_ingestion_sync_role.tf`'s `CloudWatchLogsOwnFunction` statement scoped its
+resource to the bare log-group ARN, missing the trailing `:*` needed for log-stream-level actions
+(`CreateLogStream`/`PutLogEvents`) — 6 real, successful (0-error) Lambda invocations produced zero
+CloudWatch log streams before the fix, log delivery being best-effort and not blocking the
+invocation itself. Matches AWS's own `AWSLambdaBasicExecutionRole` pattern
+(`log-group:/aws/lambda/*:*"`), unlike `lambda_execution_role.tf`'s equivalent statement (see
+decision 2 above), whose wildcard already sits inside the log-group *name*, incidentally covering
+the stream-level suffix too.
+
+**What this does not change**: the *first* time a document needs to exist in the Knowledge Base at
+all, someone still has to upload it to the S3 docs bucket — Terraform never populates the bucket,
+and this pipeline only reacts to bucket changes, it doesn't originate them. See
+[`user_guide.md`](user_guide.md#enabling-the-knowledge-base-and-ingesting-documents-pass-2-in-full)
+for the exact upload steps and how the automatic sync fits alongside the still-available manual
+`start-ingestion-job` trigger (useful when testing and you don't want to wait out the batching
+window).
+
+### The app-code follow-on: AgentCore entrypoint + DynamoDB/Knowledge Base data layer
+
+The gap called out above — no entrypoint, no Dockerfile, no cloud-backed data layer — is closed.
+Scope was deliberately kept smaller than it could have been: agents still call
+`get_fund_performance`/`search_fund_commentary` as regular in-process `@tool` functions, exactly
+as in Phase 01, just repointed at DynamoDB/a Bedrock Knowledge Base instead of SQLite/Chroma.
+
+- **`config/settings.py`**: `data_backend`/`effective_data_backend` mirror
+  `model_provider`/`effective_model_provider` exactly (see "Model provider abstraction" above) —
+  DEV can opt in, STAGING/PROD always resolve to `"aws"`.
+- **`data/dynamodb_store.py`** — same `ensure_seeded`/`fetch_fund_performance` shape as
+  `sqlite_store.py`, converting DynamoDB's `Decimal` to `float` before returning so
+  `tools/quant_tools.py`'s `json.dumps(row)` keeps working unchanged. The reverse direction needs
+  the same care: `ensure_seeded`'s `put_item` calls convert `_MOCK_FUNDS`' plain Python `float`
+  literals to `Decimal` before writing — boto3's high-level `Table` resource rejects native
+  `float` outright (`TypeError: Float types are not supported. Use Decimal types instead.`). Found
+  via a real local repro (`DATA_BACKEND=aws` CLI run): this would have crashed the deployed
+  Runtime's `lifespan` seeding hook on any fresh cold start (the running dev container just hadn't
+  restarted since an earlier working state). Fixed, and confirmed the fix doesn't touch
+  already-seeded rows — the existing `ConditionExpression` still correctly no-ops on items already
+  present.
+- **`data/knowledge_base_store.py`** — calls Bedrock's managed `Retrieve` API against the
+  Knowledge Base Terraform already provisions, rather than hand-rolling raw OpenSearch k-NN
+  queries plus our own embedding calls; the KB resource exists specifically to do that
+  end-to-end. `ensure_seeded` here is a deliberate no-op (KB ingestion is an S3-upload +
+  `start_ingestion_job` operation, not safe to run implicitly on every app startup — and since the
+  "Auto-sync ingestion" section below, the `start_ingestion_job` half of that already happens on
+  its own once a document lands in S3, so there's even less reason for app startup to touch it).
+- **`data/quant_store.py`/`data/qual_store.py`** — thin facades dispatching on
+  `effective_data_backend`, the only place that chooses between the local and AWS store. Only 4
+  existing files were touched to call the facade instead of the concrete store directly
+  (`tools/quant_tools.py`, `tools/qual_tools.py`, `cli.py`, `api/main.py`) —
+  `sqlite_store.py`/`chroma_store.py` themselves are untouched.
+- **`runtime_entrypoint.py`** — `bedrock_agentcore.runtime.BedrockAgentCoreApp`,
+  `@app.entrypoint` reading `payload["prompt"]`, reusing `build_rfp_graph` and
+  `summarize_result`/`summarize_exception` exactly as `cli.py`/`api/routes/rfp.py` already do — no
+  new translation logic, the same never-crash resilience contract. Implements the HTTP contract
+  AgentCore Runtime requires (`POST /invocations`, `GET /ping`), confirmed against Strands' own
+  AgentCore deployment guide.
+- **`Dockerfile`** (repo root) — `linux/arm64` (AgentCore Runtime runs on Graviton, not optional),
+  `uv`-based. No `environments/.env.*` file is baked into the image — Terraform's
+  `agent_runtime_artifact.environment_variables` sets real process environment variables
+  directly, and `Settings` reads those with no env file needed.
+
+**Confirmed working end-to-end, not just unit-tested**: a real local `uv run python -m uvicorn
+amc_orchestrator.runtime_entrypoint:app` smoke test — `GET /ping` healthy, a missing-`prompt`
+payload correctly rejected, and one real `POST /invocations` call against real Ollama actually
+completing (`succeeded=true`, a real compliant synthesized report). `docker build --platform
+linux/arm64` itself was not verified in that session (Docker Desktop's daemon wasn't running) —
+flagged as unverified rather than assumed working; worth doing before trusting the image builds.
+
+### What's still a placeholder
+
+`modules/lambda-tools` creates real, invokable Lambda functions wired into the Gateway, but their
+handler code is still a trivial stub (`return {"status": "not_implemented", ...}`) — real
+Gateway-routed tool logic and wiring AgentCore Memory into the graph (so conversation state
+persists cross-turn) were explicitly deferred, a separate and larger follow-on, not part of the
+work described just above. `aws_bedrockagentcore_agent_runtime` itself is still gated behind
+`enable_agent_runtime` (default `false`) until a real image built from the new `Dockerfile` is
+pushed to the ECR repo `modules/ecr` creates — Terraform deliberately never runs `docker build`.
+
+### Testing the deployed Runtime: Streamlit's SigV4-backed Runtime mode
+
+`src/amc_orchestrator/ui/streamlit_app.py` (see "Running via the Streamlit UI" in
+[`user_guide.md`](user_guide.md)) has a sidebar "Target" radio with two modes: `Local API server`
+(the pre-existing thin HTTP client over `POST /api/v1/rfp`) and `Deployed AgentCore Runtime
+(AWS)`. Runtime mode calls `boto3`'s `invoke_agent_runtime` directly, SigV4-signed, with no local
+server involved at all — it uses whatever AWS credentials are already active in the environment
+(the same ones used for `terraform apply`), takes an AWS region + Agent Runtime ARN instead of an
+API base URL, and shows a live status badge via `bedrock-agentcore-control`'s
+`get_agent_runtime` (the runtime id is parsed from the ARN's last path segment). Both modes return
+the identical `RfpOutcome` JSON shape (`runtime_entrypoint.py`'s `invoke()` and the API route both
+return `dataclasses.asdict(outcome)`), so `render_result` needed no changes to handle either.
+
+A genuine Streamlit widget-lifecycle bug was found and fixed while wiring this up, reproduced in
+an isolated script before touching the real file to rule out anything else being the cause: a
+`key`-bound widget (e.g. `st.text_input(..., key="aws_region")`, no explicit `value=`) only
+reliably shows a pre-populated `st.session_state[key]` as its *displayed* value if the widget is
+instantiated on the **same script run** where that default was first set. Since Local mode is the
+default target, the Runtime-only widgets only render for the first time on a **later** rerun
+(after the user switches modes) — Streamlit rendered them blank instead of picking up the
+already-correct session-state value, which surfaced as a real, user-facing `ValueError: Invalid
+endpoint: https://bedrock-agentcore-control..amazonaws.com` (empty region) the first time a real
+Runtime ARN was entered. Fixed by passing `value=` explicitly on all three affected `text_input`s
+(the API base URL field included, defensively, even though it wasn't observed broken — it only
+"worked" by coincidence of being the default-rendered branch).
+
+Verified via Playwright driving headless Chromium against the real running Streamlit app (no
+`chromium-cli` in this environment, so Playwright was installed standalone into the scratchpad and
+driven via a small Node script): default state unchanged, mode switch shows the right fields,
+entering the real deployed Runtime ARN shows a genuine "Runtime READY" badge, and submitting the
+INC2 example query in Runtime mode returned a real synthesized report (Approved, 1 compliance
+attempt, 8.3s) rendered correctly via the existing result view.
+
+### Streamlit Admin panel: uploading KB documents from the UI
+
+A sidebar "📄 Admin: Upload KB documents" expander (collapsed by default, and independent of the
+Local/Runtime connection mode above — it's a plain S3 action, not an RFP call) lets a tester drop
+fund-commentary files straight into the Knowledge Base's S3 docs bucket without leaving the UI or
+dropping to the CLI. A bucket-name text input plus a multi-file `st.file_uploader` feed an
+**Upload to S3** button (`s3.put_object` per file, same active AWS credentials as Runtime mode)
+and a **List documents in bucket** button (`s3.list_objects_v2`, to confirm what's actually there
+before/after). No separate ingestion step is needed afterward — the existing
+`modules/kb-ingestion-sync` auto-sync pipeline (see "Auto-sync ingestion" above) picks up the
+upload within its ~5 minute batching window.
+
+Verified live the same way as Runtime mode above: Playwright/headless Chromium confirmed the panel
+renders correctly, the bucket-name input commits on the expected Streamlit rerun, `Upload to S3`
+is correctly disabled with no file chosen, `List documents in bucket` correctly enables once a
+bucket name is entered, and there are zero browser console errors.
+
+### Environment lifecycle: teardown and cost control
+
+Beyond teardown, dev can also opt into a cheaper vector store while it's running —
+`vector_store_backend = "s3_vectors"` (see "Dev-only vector store choice" above) creates zero
+OpenSearch resources at all, including the collection itself, for full cost savings.
+`modules/s3-vectors` was itself built teardown-friendly from day one (`force_destroy = true` on
+the vector bucket) specifically so it doesn't repeat the class of bug described next.
+
+`terraform destroy` on a dev environment that has actually been used (a pushed ECR image, ingested
+S3 documents, ingested OpenSearch vector documents) hits AWS's and the OpenSearch community
+provider's standard "won't delete non-empty resources" safety checks — the ECR repo and S3 bucket
+refuse deletion with real AWS "not empty" errors, and `opensearch_index` has its own
+`force_destroy` check. `modules/ecr` (`force_delete = true`), `modules/s3-kb-docs`
+(`force_destroy = true`), and `modules/opensearch-index` (`force_destroy = true`) now set these
+flags so any future destroy of these shared modules — dev, staging, or prod, since all three
+environments share the same modules — won't hit the same blocker.
+
+**Why a plain `terraform apply` to add those flags doesn't retroactively fix an in-progress
+destroy**: `terraform destroy` deletes using each resource's *last-applied state*, not the
+freshly-edited `.tf` config — a code change to a destroy-relevant flag needs an `apply` to land in
+state before a subsequent `destroy` will honor it. On dev, an `apply` at that point would have
+*recreated* the ~30 resources already destroyed earlier in the same run (`enable_agent_runtime`/
+`enable_knowledge_base` were still `true` in tfvars), and a `-target`-scoped apply for just the 3
+resources hit unrelated pre-existing schema drift on the OpenSearch index's `mappings.fields` that
+would have forced a destroy+recreate instead of a clean in-place flag update. Dev was actually
+torn down by clearing the blocking content directly via AWS APIs instead of fighting Terraform's
+incremental-apply semantics: `ecr batch-delete-image` (all pushed digests), S3
+`delete_object_versions` (versioning was on, so a plain `delete_object` wouldn't have been enough),
+and a direct SigV4-signed `DELETE` HTTP call to the AOSS collection endpoint's index path
+(confirmed AOSS's REST API surface is genuinely limited — `_delete_by_query` 404'd, `_search`
+403'd, but `_cat/indices`/`_count`/a direct index `DELETE` all worked). A re-`plan`/`apply` after
+that succeeded clean with the new flags now in state for good.
+
+## Phase 03 — CI/CD (GitHub Actions)
+
+Everything above still describes how the system is built and deployed when a human runs Terraform
+and `docker build`/`push` by hand. Phase 03 automates that via two GitHub Actions workflows and a
+new Terraform root module for CI's own AWS identity — full operational steps live in
+[`ci_cd_runbook.md`](ci_cd_runbook.md); this section covers the design and why, in the same spirit
+as the rest of this document.
+
+**Four decisions, made explicitly with the user rather than assumed, shape everything below**:
+OIDC federated auth instead of long-lived access-key secrets; every deploy — including dev — is
+`workflow_dispatch`-only, nothing auto-deploys on merge; the same image is built once (in dev) and
+promoted byte-for-byte into staging's and prod's own ECR repos rather than rebuilt per environment;
+and no GitHub Environment required-reviewer gate on staging/prod.
+
+### `infra/terraform/github-oidc/` — CI's own AWS identity
+
+A standalone root module, sibling to `bootstrap/`/`environments/*` rather than nested in either —
+conceptually it's a repo-wide CI-identity concern spanning all three environments, not part of the
+state-bucket bootstrap or any one environment's phased apply. It reuses the state bucket
+`bootstrap/` already created as its own remote-backend key (unlike `bootstrap/` itself, this module
+has no chicken-and-egg problem — the bucket already exists by the time this applies), and is
+applied once, locally, by a human — the one piece of CI infrastructure that can't bootstrap itself,
+since CI can't create the very role it needs in order to authenticate at all.
+
+- **The OIDC provider's certificate thumbprint is fetched live** (`data "tls_certificate"` against
+  GitHub's own `.well-known/openid-configuration`), not hardcoded — the pattern the Terraform AWS
+  provider's own docs recommend for this exact resource, and it avoids silently going stale if
+  GitHub ever rotates their signing CA, a real, historical event for this specific provider.
+- **One shared, read-only `plan` role**, not one per environment. Trusted only for
+  `sub = "repo:<org>/<repo>:pull_request"` tokens (`StringEquals`, not `StringLike`) — used
+  exclusively by `pr-validate.yml`'s `tf-plan` job, which runs automatically on every PR including
+  from less-trusted pushes. Its permissions are the AWS-managed `ReadOnlyAccess` policy, not a
+  hand-rolled read policy — deliberately: `terraform plan` needs read access to essentially every
+  resource type this project's modules touch, and an incomplete custom read policy would silently
+  break `plan` on whatever action got missed, the exact class of bug this project already hit once
+  for real (`s3vectors:GetVectors` — see "Dev-only vector store choice" above). `ReadOnlyAccess`
+  guarantees zero mutating actions regardless of how complete a hand-written list would have been,
+  so the "a PR can never apply anything" safety property holds unconditionally. Shared rather than
+  per-environment because the blast radius of over-broad *read* access is low — three
+  near-identical roles would add real maintenance cost for no meaningful safety gain here.
+- **Three per-environment `deploy-<env>` roles**, trusted only for
+  `sub = "repo:<org>/<repo>:environment:<env>"` tokens. This is the actual safety property, not
+  just a workflow-YAML convention: GitHub only ever mints a token carrying an `environment:` claim
+  for a job that explicitly declares `environment: <env>`, which a `pull_request`-triggered job
+  never does — so even a misconfigured workflow can't get a PR run to assume a deploy role, the
+  trust policy itself refuses it, independent of whatever GitHub Environment protection-rule
+  settings happen to be configured. Permissions are scoped by resource-name-prefix
+  (`amc-orchestrator-<env>-*`) everywhere the target AWS service's ARN format supports it,
+  following the exact precedent already established in `modules/iam/lambda_execution_role.tf`'s
+  `CloudWatchLogsOwnFunctions` statement — this is what stops the new CI identity from quietly
+  undermining the project's existing isolation model (naming convention + separate Terraform
+  state, not separate AWS accounts — see "Three architectural decisions" above). A handful of
+  actions are AWS-imposed exceptions that need `Resource = "*"` regardless of scoping intent
+  (`ecr:GetAuthorizationToken`, most OpenSearch Serverless control-plane actions, `kms:CreateKey`,
+  Lambda event-source-mapping actions) — each is called out inline in `deploy_role.tf` so it
+  doesn't read as an oversight. One deliberate, commented crack in the per-environment isolation:
+  `deploy-staging`/`deploy-prod` also get narrow, read-only access to **dev's** ECR repo
+  specifically (never wildcarded), required for the promotion step below. A few S3 Vectors/
+  AgentCore action names are flagged as best-effort/unverified against a live apply, the same
+  honest-uncertainty pattern this project already uses for `S3VectorsDataPlane`'s real incident —
+  expect to add a missing action if a real apply through this role surfaces one. Each `deploy-<env>`
+  role's permissions are split across **three customer-managed policies** (core infra / AgentCore+AI
+  / compute+messaging), attached via `aws_iam_role_policy_attachment`, not one combined inline
+  policy — a real incident found this the hard way (see root `CLAUDE.md`'s Phase 03 history):
+  AWS's 10,240-byte inline-policy limit is an *aggregate* across all inline policies on a role, not
+  per-document, so a first attempt at a 2-way inline split still blew through it once both documents
+  co-existed on one role, leaving one environment's deploy role with no policy attached at all.
+  Managed policies carry their own separate 6,144-byte limit that applies *per policy*, and a role
+  can attach up to 10 by default — real headroom for the next round of real-apply-driven fixes,
+  which this project has needed more than once already.
+
+### `pr-validate.yml` — automatic, never mutates AWS
+
+Runs on every PR to `main`, gated per job by `dorny/paths-filter` so unrelated changes skip
+irrelevant work: ruff/mypy/`pytest tests/unit` for app changes, an arm64 Docker build sanity check
+(QEMU-emulated on the default x86_64 runner, `--output=type=cacheonly` so it validates the build
+without producing a real, pushable image) for Docker-relevant changes, and `terraform fmt`/
+`validate` (no AWS credentials — matches `infra/terraform/README.md`'s own long-standing claim that
+`validate` needs none) plus `terraform plan` (the read-only role above, output posted as an
+upserted PR comment per environment) for Terraform changes. The one deploy-adjacent thing it
+deliberately never does is apply or push — that invariant is what makes it safe to run unattended
+on every PR, including from a contributor whose intentions haven't been vetted.
+
+### `deploy.yml` — manual only, the only workflow that mutates AWS
+
+`workflow_dispatch`-only, four jobs. `ensure-ecr` runs first for every dispatch —
+`terraform apply -target=module.ecr`, idempotent — so a cold environment (zero Terraform state)
+has its ECR repo created by Terraform itself before anything tries to push or promote into it.
+This exists because `build-and-push`/`promote` otherwise run *before* `terraform-apply` would
+normally create that repo, which only surfaced as a real bug once dev was actually torn down to
+zero resources and redeployed via CI for the first time (see root `CLAUDE.md`'s Phase 03 history) —
+deliberately a targeted `terraform apply`, not a raw `aws ecr create-repository` call, since an
+out-of-band-created repo would make the next full apply fail with "already exists" against a
+resource Terraform doesn't know about. `build-and-push` (dev target only) builds fresh from source
+and tags with the full git commit SHA — the only place `docker build` ever runs. `promote`
+(staging/prod targets) copies that exact already-built image into the target environment's own ECR
+repo via `crane copy` rather than rebuilding — a registry-to-registry copy by manifest digest, no
+local `docker pull`/`push` round-trip and no QEMU needed at all, since `crane` never executes the
+image, only copies bytes — so what runs in staging/prod is guaranteed byte-identical to what was
+built and tested in dev, not merely "built from the same commit." `terraform-apply` declares
+`environment: <input>` (this is what resolves the job's Environment-scoped `AWS_DEPLOY_ROLE_ARN`
+variable and keeps GitHub's "restrict deployment branches to `main`" setting enforced), resolves
+the image URI, and passes it via `terraform apply -var="container_image_uri=..."` rather than
+committing it to tracked `terraform.tfvars` — a convention change from how dev's tfvars used to
+work (a real, hardcoded image tag committed to git), adopted across all three environments for
+consistency: it decouples app-deploy cadence from infra-config commits, and avoids repeating the
+same "real, environment-specific identifier checked into version control" pattern this phase
+otherwise moved away from. A `promote_image` boolean input lets an operator run a staging/prod
+pass-1/pass-2-only apply through this same generic workflow without forcing a meaningless
+promotion when `enable_agent_runtime` is still `false` and no image is involved yet — the same
+generic workflow handles a from-scratch, never-applied environment's entire first rollout, one pass
+at a time, with no special-cased pipeline logic (see `ci_cd_runbook.md`'s runbook sequence).
+
+### Two gotchas resolved explicitly with the user, not assumed
+
+1. **GitHub Environment required-reviewer gates don't let the person who triggered a run approve
+   their own deployment.** On a single-maintainer project, adding one to staging/prod would
+   deadlock every deploy unless a second GitHub account is always available to click approve — a
+   real, non-obvious practical constraint, not a hypothetical edge case. Resolved: no
+   required-reviewer gate at all. The manual `workflow_dispatch` trigger, OIDC role-scoping, and
+   restricting each Environment's deployment branch to `main` are the safety net instead.
+2. **The shared read-only plan role can't be Environment-scoped without quietly undermining its own
+   trust-policy safety property.** If `tf-plan` declared `environment: <env>` (the general
+   preference used everywhere else, so its variables could be Environment-scoped too), its OIDC
+   token would carry the same `sub` claim shape the deploy roles trust on — narrowing "a PR run can
+   never carry an `environment:` claim" right when it matters most. Resolved by keeping
+   `AWS_PLAN_ROLE_ARN`/`TF_STATE_BUCKET` as repo-level GitHub variables and never declaring
+   `environment:` on that job — `AWS_DEPLOY_ROLE_ARN` stays Environment-scoped since `deploy.yml`'s
+   jobs are supposed to carry that context.
+
+### Why GitHub Environment protection rules aren't Terraform-managed
+
+Codifying them via the `integrations/github` provider would need its own GitHub PAT/App
+credential — a whole new credential surface for a one-time, rarely-changed setting. For a
+single-maintainer project that trade-off isn't worth it; [`ci_cd_runbook.md`](ci_cd_runbook.md)
+documents the one-time manual steps instead.
+
+## Repository map
+
+```
+src/amc_orchestrator/
+├── main.py                        # amc-orchestrator console script → uvicorn launcher
+├── cli.py                         # direct graph invocation (pre-API smoke testing)
+├── runtime_entrypoint.py          # AgentCore Runtime entrypoint (BedrockAgentCoreApp, /invocations, /ping)
+├── config/
+│   ├── settings.py                # Settings(BaseSettings), get_settings() cached singleton
+│   ├── model_factory.py           # get_model() — only place that imports OllamaModel/BedrockModel
+│   ├── compliance_rubric.py       # single source of truth for the rubric text
+│   └── messages.py                # ESCALATION_HOLDING_MESSAGE, shared safe-fallback text
+├── data/
+│   ├── sqlite_store.py            # quant data (SQLite, DEV local backend)
+│   ├── dynamodb_store.py          # quant data (DynamoDB, aws backend)
+│   ├── quant_store.py             # facade: dispatches sqlite_store vs dynamodb_store
+│   ├── chroma_store.py            # qual data (persistent Chroma, DEV local backend)
+│   ├── knowledge_base_store.py    # qual data (Bedrock Knowledge Base Retrieve API, aws backend)
+│   └── qual_store.py              # facade: dispatches chroma_store vs knowledge_base_store
+├── tools/
+│   ├── quant_tools.py             # @tool get_fund_performance
+│   └── qual_tools.py              # @tool search_fund_commentary
+├── schemas/
+│   └── compliance.py              # ComplianceVerdict
+├── agents/
+│   ├── quant_agent.py  qual_agent.py  compliance_agent.py  revisor_agent.py  synthesizer_agent.py
+├── observability/
+│   ├── logging_setup.py  hooks.py
+│   └── readiness.py                # check_readiness() — GET /health/ready backing logic
+├── workflows/
+│   ├── routing.py                 # needs_revision / ready_to_synthesize condition functions
+│   ├── graph_build.py             # build_rfp_graph(settings)
+│   └── result_extraction.py       # RfpOutcome, summarize_result, summarize_exception
+└── api/
+    ├── main.py                    # create_app(), lifespan, CORS, /health, /health/ready
+    └── routes/rfp.py              # POST /api/v1/rfp
+```
+
+`Dockerfile` lives at the repo root (sibling to `src/`, `infra/`) — builds the image
+`runtime_entrypoint.py` runs inside, normally built/pushed by `.github/workflows/deploy.yml` (see
+"Phase 03" below), pushed to the ECR repo `infra/terraform/modules/ecr` creates.
+
+```
+infra/terraform/
+├── bootstrap/                     # one-time: S3 state bucket, its own local state
+├── github-oidc/                   # one-time: GitHub Actions OIDC provider + plan/deploy IAM roles (Phase 03)
+├── modules/                       # reusable, environment-agnostic (see table above)
+│   ├── iam/  ecr/  s3-kb-docs/  dynamodb/
+│   ├── opensearch-serverless/  opensearch-access-policy/  opensearch-index/
+│   ├── s3-vectors/                # dev-only alternative to opensearch-index (vector_store_backend)
+│   ├── knowledge-base/  lambda-tools/
+│   ├── agentcore-memory/  agentcore-gateway/  agentcore-runtime/
+│   └── observability/
+└── environments/
+    ├── dev/       # cheapest defaults: no CMKs, single-AZ OpenSearch, short retention
+    ├── staging/   # mirrors prod's security posture (CMKs, HA) for pre-prod validation
+    └── prod/      # full HA + longest retention + deletion protection everywhere
+```
+
+```
+.github/workflows/                 # Phase 03 - see "Phase 03 — CI/CD" above
+├── pr-validate.yml                # automatic on every PR: lint/type/unit tests, docker build sanity, terraform fmt/validate/plan
+└── deploy.yml                     # workflow_dispatch only: build+push (dev), promote via crane (staging/prod), terraform apply
+```

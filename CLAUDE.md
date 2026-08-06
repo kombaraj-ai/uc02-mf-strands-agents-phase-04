@@ -1,0 +1,1476 @@
+# AMC RFP & Portfolio Insight Orchestrator — Phase 01 (DEV)
+
+Multi-agent Strands Agents system for a Mutual Fund AMC. Ingests an
+institutional RFP / portfolio query and produces a compliant, client-ready
+response via a self-correcting compliance loop (Quant + Qual → LLM-as-a-Judge
+Compliance → Revisor → re-check → Synthesizer).
+
+Full plan: `C:\Users\komba\.claude\plans\mutable-wibbling-turtle.md` (approved,
+in-progress). Original business-requirements brainstorm (untrusted for API
+calls, trusted for business rules/rubric/mock data):
+`DEV - AMC RFP and Portfolio Orchestrator.md`.
+
+## Stack
+
+- **Package manager**: `uv` (src-layout package `src/amc_orchestrator/`)
+- **Agent framework**: `strands-agents` v1.47 (real PyPI package — see "API
+  gotchas" below, a lot of hallucinated API calls exist in blog posts/docs)
+- **DEV LLM**: `MODEL_PROVIDER` env var, default `ollama` (`qwen2.5:7b-instruct`,
+  chosen over llama3.2 for reliable structured-output/tool-calling; already
+  pulled locally). Can opt into `bedrock` per-run instead (needs AWS
+  credentials, real cost) for use cases where local CPU-only generation is
+  too slow — see `Settings.effective_model_provider` in "Conventions"
+  below and `docs/user_guide.md`'s "Switching model provider" section.
+- **DEV data**: SQLite (`local_dev.db`, gitignored) for quant metrics,
+  persistent on-disk ChromaDB (`data/chroma/`, gitignored) for qual RAG
+- **STAGING/PROD** (not built yet): always `BedrockModel` via
+  `config/model_factory.py` regardless of `MODEL_PROVIDER` — zero
+  agent-code changes required, only `ENVIRONMENT` + AWS credentials
+- **API**: FastAPI (`api/main.py` + `api/routes/rfp.py`, Milestone 8 - `POST
+  /api/v1/rfp`, `GET /health`, `GET /health/ready`; start via `uv run python
+  -m amc_orchestrator.main` or the `amc-orchestrator` console script)
+- **Logging**: structlog, JSON or console renderer
+- **Tests**: pytest, `unit` (fast, no LLM) vs `integration` (marker
+  `@pytest.mark.integration`, needs Ollama running, auto-skips if not)
+
+## How to resume work
+
+```powershell
+# 1. Confirm Ollama is running with the right model
+ollama list   # should show qwen2.5:7b-instruct
+ollama serve  # if not already running as a service
+
+# 2. Sync deps (uv.lock is committed)
+uv sync
+
+# 3. Fast unit suite (no LLM needed) - should always be green
+uv run pytest tests/unit -q
+
+# 4. Smoke test the graph directly (slow - 5-10+ min on CPU-only Ollama)
+uv run python -m amc_orchestrator.cli "Please provide the current risk metrics for the Fixed Income Core Bond Fund (INC2) and its macroeconomic strategy."
+
+# 5. Integration tests (slow, needs Ollama; skips gracefully if unreachable)
+uv run pytest tests/integration -m integration -q
+
+# 6. Start the API server (M8) - POST /api/v1/rfp, GET /health, /docs
+uv run python -m amc_orchestrator.main
+```
+
+Check `git log --oneline` for the milestone-by-milestone commit history —
+each commit is a working, tested checkpoint.
+
+## Current status (as of last session)
+
+Working through the approved plan's 10 milestones sequentially:
+
+- [x] M0 — De-risked cyclic-graph behavior by reading the *actual installed*
+      `strands/multiagent/graph.py` source directly instead of guessing —
+      see "API gotchas" below, this is where the two real bugs were found.
+- [x] M1 — `uv` skeleton, `Settings`/`model_factory`, git init.
+- [x] M2 — `data/sqlite_store.py` + `data/chroma_store.py`, 4 mock funds
+      (EQG1 Largecap, SMC3 Smallcap/high-risk, INC2 Debt, BLN4 Hybrid), 9 unit tests.
+- [x] M3 — `tools/quant_tools.py` + `tools/qual_tools.py`, 4 unit tests.
+- [x] M4 — `observability/logging_setup.py` + `hooks.py`, quant agent
+      smoke-tested against real Ollama.
+- [x] M5 — qual, compliance (LLM-as-a-Judge, `structured_output_model`),
+      revisor, synthesizer agents all written and individually smoke-tested.
+- [x] M6 — `workflows/routing.py` + `graph_build.py` + `cli.py` written.
+      **Both bugs below confirmed fixed** via a 3rd CLI verification run
+      (`/tmp/cli_lowrisk3.log`, PAUSED session's last action): node ordering
+      was correct (compliance_check ran only after quant+qual, no premature
+      parallel execution of revise_draft/final_synthesis), and when
+      `qwen2.5:7b-instruct` hit `StructuredOutputException` again on
+      `compliance_check` (2nd occurrence out of 3 runs - see "known
+      flaky things"), the CLI caught it gracefully via
+      `summarize_exception()` and printed the proper escalation holding
+      message instead of crashing (exit code 0). **This is still only a
+      crash-proofed failure, not a successful full run** - we have not yet
+      seen this exact low-risk query complete with an APPROVED verdict and
+      a real synthesized report, only the escalation fallback. Code changes
+      from this verification are committed; not yet re-run to see a clean
+      APPROVED pass.
+- [x] M7a — Added `Agent(retry_strategy=...)` investigation +
+      `_RetryingComplianceAgent` (`agents/compliance_agent.py`): confirmed
+      the built-in `ModelRetryStrategy` only retries `ModelThrottledException`,
+      never `StructuredOutputException`, so a manual clean-slate retry
+      (`compliance_structured_output_max_attempts`, default 3 total
+      attempts) was added around just the compliance node. Unit-tested
+      (`tests/unit/test_compliance_agent_retry.py`, mocked, no Ollama). This
+      *did* work exactly as designed on a live CLI re-run - **but the same
+      run still failed 3/3 attempts** and escalated. See the "root cause
+      found" addendum to Bug #2 below for why the retry alone can't fully
+      close this gap, and why it's being parked rather than chased further.
+- [x] M7b — `test_graph_smoke.py`/`test_smc3_high_risk.py` hardened to
+      assert the resilience contract (never crash; either a real compliant
+      completion or a proper escalation) via the same
+      try/except-around-`graph(...)` pattern as `cli.py`, instead of a
+      guaranteed APPROVED outcome - see Bug #2 addendum. **Both passed** on
+      a real run against Ollama (`uv run pytest tests/integration -m
+      integration -q`, 2 passed in ~19 min - `smc3` in particular needs at
+      least 2 real `compliance_check` passes plus a `revise_draft` cycle to
+      pass at all, so this is a genuine end-to-end proof, not a vacuous one).
+- [x] M8 — FastAPI REST layer. `api/main.py` (app factory, `lifespan`
+      startup - **not** the deprecated `@app.on_event`, see "API gotchas" -
+      seeds SQLite/Chroma, CORS from `settings.cors_origin_list`, `/health`),
+      `api/routes/rfp.py` (`POST /api/v1/rfp`, the exact same
+      try/except → `summarize_exception()` safety net as `cli.py`), and
+      `main.py` (`run()` - fills in the `amc-orchestrator` console-script
+      entry point already declared in `pyproject.toml` since M1, which had
+      no implementation until now). 4 unit tests
+      (`test_api_rfp.py`, mocked `build_rfp_graph`, no Ollama needed) plus a
+      live out-of-process `uvicorn` smoke test (`/health`, `/openapi.json`,
+      and a validation-rejection POST all confirmed working for real, not
+      just via `TestClient`).
+- [x] M9 — `docs/architecture.md` (system reference: graph topology, both
+      real bugs and their fixes, termination/synthesizer/data-layer/model-
+      abstraction/observability design, repo map), `docs/user_guide.md`
+      (setup, full `Settings` env-var reference, mock fund data table, CLI +
+      API usage with PowerShell-friendly examples, troubleshooting),
+      `docs/compliance_rubric.md` (verbatim mirror of
+      `config/compliance_rubric.py`, per that file's own docstring promise),
+      `docs/postman/amc_orchestrator.postman_collection.json` (health check +
+      low-risk INC2 + high-risk SMC3 + validation-error requests against the
+      real `POST /api/v1/rfp`). This CLAUDE.md remains the working session
+      log; those are the stable reference docs.
+- [x] M10 — hardening. Two of the four plan items were already solid before
+      this pass: ticker-not-found at the tool/data layer
+      (`test_tools.py::test_get_fund_performance_unknown_ticker_returns_error_payload`)
+      and malformed/missing-verdict fallback in routing
+      (`test_routing.py`'s `None`-verdict cases, including at
+      `max_attempts=1`) - both already unit-tested, no new code needed.
+      Added this session: **readiness endpoint**
+      (`observability/readiness.py` + `GET /health/ready`, checks Ollama
+      reachability in dev and SQLite/Chroma dir writability, 200 when ready
+      else 503; `tests/integration/conftest.py` now reuses the same
+      `ollama_reachable()` instead of duplicating it; 5 new unit tests +
+      2 API unit tests + a live out-of-process smoke test of both the
+      ready and not-ready cases, confirmed working), **`test_forced_escalation.py`**
+      (the SMC3 bait question with `MAX_COMPLIANCE_ATTEMPTS` forced to 1 via
+      the new `isolated_graph_settings_single_attempt` fixture - the real
+      end-to-end proof that a REJECTED draft never escapes just because the
+      attempt budget is exhausted, complementing routing.py's isolated unit
+      proof - **passed live, twice independently**, 551s and again as part
+      of a combined run), and **`test_ticker_not_found.py`** (a nonexistent
+      ticker query through the real graph, proving the agent layer - not
+      just the tool wrapper - reports missing data honestly instead of
+      fabricating figures - **passed live**, 373s).
+
+  **Verification note**: the dev machine ran critically low on RAM
+  (0.47GB free / 15.69GB total, likely from a long Ollama session plus
+  unrelated apps) partway through this milestone's verification, which
+  killed several background `pytest` runs outright (not a test failure -
+  no assertion ever ran; the process itself died mid-run, confirmed via
+  `Get-Process`/`Get-NetTCPConnection` showing no stray processes and
+  `ollama ps` showing genuine 100% CPU generation each time). `test_graph_smoke.py`
+  and `test_smc3_high_risk.py` were **not** re-run fresh after the M10
+  conftest.py refactor because of this - they already passed together
+  earlier this session (see M7b, 1144s clean run) before that refactor,
+  which only extracted a shared `_build_isolated_settings()` helper and
+  swapped a locally-duplicated `_ollama_reachable()` for the identical
+  `observability.readiness.ollama_reachable()` - verified by inspection to
+  be behavior-preserving (same env vars, same seeding calls, same
+  fixture yield/cache-clear pattern). If you have RAM headroom, re-running
+  `uv run pytest tests/integration -m integration -q` once fully (all 4)
+  is worthwhile but not believed necessary.
+
+  Also found and fixed in passing: an earlier session's manual
+  `uv run uvicorn ... &` / `kill %1` smoke tests (see M8) left orphaned
+  Windows processes bound to ports 8123-8126 that `kill %1` doesn't
+  reliably reap on this platform (Git Bash job control only kills the
+  top-level handle, not `uv run`'s child process) - these were silently
+  competing for CPU with later Ollama runs. Cleaned up via
+  `Stop-Process` (user-confirmed, since it's a system-wide process kill).
+  **Takeaway for next time**: prefer capturing the PID explicitly (e.g.
+  `uv run uvicorn ... & echo $!`) and verify termination with
+  `Get-NetTCPConnection -LocalPort <port>` after `kill`, rather than
+  trusting `kill %1` alone on Windows.
+
+### Immediate next step (session resumed 2026-07-11)
+
+**Decision made 2026-07-11**: the `StructuredOutputException` flakiness is a
+known, root-caused DEV-only limitation (Ollama ignores `tool_choice` - see
+Bug #2 addendum). It's parked, not chased further. M7 (retry fix + hardened
+integration tests), M8 (FastAPI layer), M9 (docs), and M10 (hardening) are
+all done this session - all four are the last of the originally-planned 10
+milestones. **All 10 milestones are now checked off.**
+
+**Post-M10 addition (same session, 2026-07-11)**: DEV can now opt into
+Bedrock per-run instead of Ollama (`MODEL_PROVIDER=bedrock` +
+`Settings.effective_model_provider` - see "Conventions" below), for use
+cases where local CPU-only Ollama generation is too slow. This directly
+mitigates the Bug #2 flakiness for whoever opts in (Bedrock/Claude
+supports real `tool_choice` forcing), without waiting on a full STAGING
+environment. Unit-tested (`test_settings.py`, `test_model_factory.py`,
+`test_readiness.py`'s new dev+bedrock case) and live-smoke-tested
+(`/health/ready` confirmed to skip its Ollama check when
+`MODEL_PROVIDER=bedrock`).
+
+**Verified against real Bedrock, 2026-07-11**: the user ran the CLI with
+`MODEL_PROVIDER=bedrock` (`anthropic.claude-3-5-sonnet-20241022-v2:0`,
+`us-east-1`) against the INC2 low-risk query - `graph_status=completed`,
+`compliance_attempts=1`, `escalated=False`, **11.64 seconds total**
+(vs. 5-10+ minutes on Ollama). `compliance_check` returned
+`stop_reason=tool_use` - Claude invoked `ComplianceVerdict` natively, no
+forced-retry needed at all, confirming the Bug #2 root-cause fix in
+practice, not just in theory. Full node-by-node trace, timing table, and
+analysis: [`docs/sample_invocation_walkthrough.md`](docs/sample_invocation_walkthrough.md).
+
+Natural next steps from here, none yet scoped: broader hardening
+(readiness when Bedrock/AWS creds are misconfigured, load testing), CI
+wiring (a GitHub Actions workflow was never set up - `uv run pytest
+tests/unit` is a natural fast gate, integration tests would need a hosted
+Ollama runner or `MODEL_PROVIDER=bedrock` with CI-provisioned AWS
+credentials), or a full STAGING environment setup exercised end-to-end.
+
+## Architecture (why it's built this way)
+
+Five agents as Strands Graph nodes:
+`quant_data_pull`, `qual_narrative_pull` (entry points, parallel) →
+`compliance_check` (LLM-as-a-Judge, `structured_output_model=ComplianceVerdict`)
+→ either `revise_draft` (loops back to `compliance_check`) or
+`final_synthesis`, gated by conditions in `workflows/routing.py`.
+
+**Termination has two layers**: `MAX_COMPLIANCE_ATTEMPTS` (default 3,
+graceful — forces synthesis even if still REJECTED) and
+`GRAPH_MAX_NODE_EXECUTIONS` (hard ceiling — if this actually fires, the
+whole graph fails with **no output at all**, so the graceful layer must
+always resolve first; see `routing.py`'s module docstring).
+
+**Synthesizer has two branches, never blended**: APPROVED → full polished
+report; anything else → the exact `ESCALATION_HOLDING_MESSAGE` from
+`config/messages.py` (single source of truth, shared with the graph-level
+exception fallback in `workflows/result_extraction.py`).
+
+## API gotchas (learned the hard way — read before touching graph_build.py/routing.py)
+
+The original brainstorm doc invented APIs that don't exist
+(`OllamaProvider`, `add_conditional_edges`, `set_recursion_limit`,
+`app.invoke(...)`, deprecated `@app.on_event`). Real API, verified against
+the installed package source at
+`.venv/Lib/site-packages/strands/multiagent/graph.py`:
+
+- `GraphBuilder.add_edge(from, to, condition=fn)` — `condition` is
+  `Callable[[GraphState], bool]`, no `condition=` means unconditional.
+- `GraphBuilder.set_execution_timeout(seconds)` — **seconds, not
+  milliseconds** (caught a unit bug from this).
+- Models: `strands.models.BedrockModel`, `strands.models.ollama.OllamaModel`
+  (not `*Provider`).
+- Structured output: `Agent(structured_output_model=SomePydanticModel)` —
+  `AgentResult.structured_output` is populated automatically on a normal
+  `agent(...)` call (confirmed via smoke test), no need to call a separate
+  `.structured_output()` method.
+
+### Bug #1 (fixed): node readiness is OR-across-edges, not AND
+
+`Graph._is_node_ready_with_conditions` schedules a node as soon as **any
+one** incoming edge from the just-completed batch is satisfied — not once
+**all** incoming edges are satisfied. The original design gave
+`revise_draft`/`final_synthesis` unconditional edges directly from
+quant/qual "for grounding" — but since quant/qual complete in the very
+first batch, those unconditional edges fired immediately, causing
+`revise_draft` and `final_synthesis` to run **in parallel with
+`compliance_check`'s first pass**, before any verdict existed. Caught via
+an actual CLI run showing all three nodes starting within ~1 second of
+each other.
+
+**Fix**: every edge into `revise_draft`/`final_synthesis` (from quant, qual,
+*and* compliance) shares the *same* condition function
+(`needs_revision`/`ready_to_synthesize`), and those functions
+short-circuit to `False` whenever `compliance_check` hasn't executed even
+once yet (`attempts == 0`). This is why `routing.py` distinguishes
+"compliance hasn't run" from "compliance ran but produced no verdict" —
+conflating them was the root cause. See the docstrings in `routing.py` and
+`graph_build.py` for the full reasoning — **do not simplify this back to
+per-edge conditions without re-reading them.**
+
+### Bug #2 (crash-proofed; root-caused 2026-07-11 and parked as a known DEV-only limitation): StructuredOutputException crashes the whole graph
+
+`qwen2.5:7b-instruct` fails to invoke the structured-output tool even when
+forced **more often than expected - 2 of 3 end-to-end CLI runs this
+session**, always on `compliance_check`. Strands node execution is
+fail-fast - the exception propagates all the way out of `graph(...)` as a
+**raw Python exception**, not a `FAILED` GraphResult. **Fix applied**:
+`cli.py` wraps `graph(question)` in try/except and calls
+`workflows.result_extraction.summarize_exception(exc)`, so it degrades to
+the safe escalation message instead of crashing - confirmed working.
+`api/routes/rfp.py` (M8) must apply the identical try/except.
+
+**Retry added (2026-07-11)**: `Agent(retry_strategy=...)`
+(`strands.event_loop._retry.ModelRetryStrategy`) turned out to only retry
+`ModelThrottledException`, never `StructuredOutputException` - so
+`_RetryingComplianceAgent` in `agents/compliance_agent.py` was added
+instead: a manual retry that rolls the conversation back to a clean slate
+and re-sends the same input, up to `compliance_structured_output_max_attempts`
+(default 3) total attempts. Unit-tested in
+`tests/unit/test_compliance_agent_retry.py`.
+
+**Root cause found (2026-07-11), and why the retry alone isn't enough**:
+Strands "forces" the structured-output tool by setting `tool_choice` on the
+second half-turn (`StructuredOutputContext.set_forced_mode()` in
+`strands/tools/structured_output/_structured_output_context.py`). The
+Ollama model integration (`strands/models/ollama.py`) calls
+`warn_on_tool_choice_not_supported(tool_choice)` and **silently ignores
+it** - confirmed via the `UserWarning: A ToolChoice was provided to this
+provider but is not supported and will be ignored` seen in a live CLI log.
+So on this DEV stack, "forcing" never actually forces anything - the only
+real lever left is a generic text nudge
+(`DEFAULT_STRUCTURED_OUTPUT_PROMPT = "You must format the previous
+response as structured output."`), which the model remains free to ignore.
+This is why a same-session CLI re-run with the retry fix in place still
+failed **3 out of 3** attempts on `compliance_check` before escalating:
+retrying from a clean slate doesn't change the fundamental odds when the
+forcing mechanism itself is a no-op on this provider, only sampling noise
+does.
+
+**Decision (2026-07-11): parked as a known DEV-only limitation**, not
+being chased further with more prompt/retry tuning right now.
+`BedrockModel` (STAGING/PROD) supports real `tool_choice` forcing, so this
+exact failure mode is expected to be far rarer off of Ollama. The manual
+retry stays in place as free insurance (it works exactly as designed, it
+just can't guarantee an APPROVED outcome when forcing itself is inert).
+Integration tests (M7) were updated to assert the actual resilience
+contract - never crash, always a well-formed outcome (real compliant
+completion OR proper escalation) - rather than a guaranteed APPROVED
+completion.
+
+## Known slow/flaky things in DEV
+
+- Ollama generation on this machine is CPU-only and slow — a single agent
+  turn can take 60-140s, and a full low-risk query (quant+qual parallel,
+  then compliance, then synthesis) can take 5-10+ minutes end-to-end.
+  Integration tests will be slow; don't assume a hang, check `ollama ps`
+  and the log's timestamps before concluding something is stuck.
+- `qwen2.5:7b-instruct` can fail structured output generation on
+  `compliance_check` (see Bug #2) — root-caused to Ollama silently ignoring
+  `tool_choice`, so "forcing" is a no-op on this stack. A manual retry
+  (`_RetryingComplianceAgent`) is in place but does not guarantee success;
+  this is a known, parked DEV-only limitation, not a one-off fluke.
+- First Chroma run downloads the default `all-MiniLM-L6-v2` ONNX embedding
+  model (~80MB) — one-time cost, already cached at
+  `C:\Users\komba\.cache\chroma\onnx_models\`.
+
+## Conventions
+
+- Every module reads config through `config.settings.get_settings()` —
+  never `os.getenv` directly.
+- `config.model_factory.get_model()` is the *only* place that imports a
+  concrete model class — this is what makes switching provider (DEV's
+  Ollama/Bedrock toggle, or DEV→STAGING/PROD) a config change, not a code
+  change. **Provider selection is `Settings.model_provider`
+  (`"ollama"`/`"bedrock"`, default `"ollama"`), resolved through
+  `Settings.effective_model_provider`** — DEV respects `model_provider`
+  (so a run can opt into Bedrock without a separate environment, e.g. when
+  local Ollama generation is too slow for a given use case); STAGING/PROD
+  always force `"bedrock"` regardless of it. Never branch on `environment`
+  directly for provider decisions — always go through
+  `effective_model_provider` (see `observability/readiness.py` for the
+  other real consumer, which skips its Ollama-reachability check
+  accordingly).
+- Data-layer modules (`data/sqlite_store.py`, `data/chroma_store.py`) and
+  tool wrappers (`tools/*.py`) are deliberately Strands-free/thin so they're
+  unit-testable without an LLM.
+- `.env.dev` is gitignored (only `.env.dev.example` is committed) even
+  though DEV holds no real secrets — kept consistent with the STAGING/PROD
+  habit.
+- Git commits are one per milestone with a consistent message style — check
+  `git log` for the pattern before committing new work.
+
+## Phase 02 — Deployment to Amazon Bedrock AgentCore
+
+Started 2026-07-11, session in progress (not yet committed to git as of the
+last session - see "Uncommitted work" below). Full detail:
+`infra/terraform/README.md` (infra) and `docs/architecture.md`'s "Phase 02"
+section (app-code). Plan file (currently holds the app-code follow-on
+plan, the most recent of two plans this phase used - the original
+Terraform-only plan's content lives on in this log, not in that file):
+`C:\Users\komba\.claude\plans\calm-sprouting-nebula.md`.
+
+### Current status (as of last session, 2026-07-11)
+
+- [x] Terraform (`infra/terraform/`) - all modules written, `fmt`/`validate`
+      clean on all 3 environments.
+- [x] Bootstrap (state bucket) applied to real AWS.
+- [x] Dev pass 1 (`enable_knowledge_base=false`, `enable_agent_runtime=false`)
+      applied to real AWS and **live-verified** resource-by-resource (not
+      just `terraform state list`) - IAM, ECR, DynamoDB, OpenSearch
+      collection, S3, both Lambda stubs (real `invoke`), Gateway + targets
+      (`READY`), Memory + strategy (`ACTIVE`), CloudWatch dashboard/alarms.
+      Two real bugs found via live AWS checks and fixed: OpenSearch
+      name-length overflow, double-prefixed CloudWatch alarm names.
+- [x] App-code follow-on task (entrypoint, DynamoDB/Knowledge-Base data-layer
+      swap, Dockerfile) - written and verified: 64 unit tests pass, a real
+      local `uvicorn` + real Ollama end-to-end `/invocations` call
+      succeeded.
+- [x] `docker build`/`push`, `enable_agent_runtime = true` + apply, and a
+      live end-to-end `invoke_agent_runtime` smoke test - all done and
+      **live-verified against real AWS, 2026-07-12**. Three real bugs found
+      and fixed along the way (see below); the first two would have blocked
+      *every* invocation of the deployed Runtime, not just this smoke test.
+      Pass 2 (`enable_knowledge_base = true`), staging/prod applies, real
+      document ingestion, and the deferred Gateway-routed tools / AgentCore
+      Memory graph integration remain **not done**.
+
+**Real bugs found live this session, all fixed and re-verified, 2026-07-12**:
+1. **Dockerfile missing README.md**: `pyproject.toml` declares `readme =
+   "README.md"`, but the Dockerfile only `COPY`'d `pyproject.toml`/`uv.lock`
+   before `uv sync --no-install-project` - hatchling's build backend fails
+   without the readme file present even for that no-install-project pass.
+   Fixed by adding `README.md` to that `COPY` line. First-ever real `docker
+   build` of this Dockerfile - this was always going to fail, no prior
+   session had actually run it.
+2. **Deployed dev Runtime defaulted to Ollama, unreachable from AWS**:
+   `Settings.effective_model_provider` deliberately respects `model_provider`
+   (default `"ollama"`) whenever `environment == "dev"`, so a *local* dev
+   run can opt into Bedrock - but the *deployed* Runtime container also sets
+   `ENVIRONMENT=dev` (same env-var name, different purpose), and
+   `infra/terraform/environments/dev/main.tf`'s `agentcore_runtime` module
+   never set `MODEL_PROVIDER`. Every invocation failed with `ConnectError:
+   All connection attempts failed` (trying to reach `localhost:11434`
+   inside the container). Fixed by hardcoding `MODEL_PROVIDER = "bedrock"`
+   in that module's `environment_variables` - staging/prod don't need this
+   since `environment != "dev"` already forces Bedrock for them via
+   `effective_model_provider`.
+3. **`bedrock_model_id` (`anthropic.claude-3-5-sonnet-20241022-v2:0`) had
+   reached end-of-life** on Bedrock (a real `invoke_agent_runtime` call
+   returned `ResourceNotFoundException`) - confirmed via
+   `bedrock:ListFoundationModels`/`GetFoundationModel` that current-gen
+   Anthropic models on this account now require `INFERENCE_PROFILE`
+   invocation, not `ON_DEMAND`. Rather than wire up the extra
+   inference-profile IAM ARNs, switched `bedrock_model_id` to
+   `amazon.nova-lite-v1:0` instead (user's choice) - `ON_DEMAND`-invokable,
+   no profile complexity, cheaper. Verified it's sufficient for this
+   project's structured-output need: `strands/models/bedrock.py`'s
+   `BedrockModel.structured_output` only ever requests
+   `tool_choice={"any": {}}` (force *some* tool use - never a named-tool
+   force, since only one tool spec is ever passed), and Nova supports
+   `"any"` tool choice via the Converse API. `locals.tf`'s
+   `bedrock_model_arns` and both the runtime/KB IAM policies were updated
+   to the new model ARN.
+
+**Live end-to-end proof, 2026-07-12** (`invoke_agent_runtime` against
+`arn:aws:bedrock-agentcore:us-east-1:766354255780:runtime/amc_orchestrator_dev_agent_runtime-X1c5y89vze`,
+the INC2 low-risk query): `succeeded=true, graph_status=completed,
+compliance_attempts=3, escalated=true` - a well-formed graceful escalation,
+not a crash, and the *expected* outcome given `enable_knowledge_base` is
+still `false` (no commentary data exists yet for `qual_narrative_pull` to
+retrieve, so REJECTED verdicts are honest, not a bug). This proves the
+Runtime, its IAM role, DynamoDB self-seeding (`runtime_entrypoint.py`'s
+`lifespan` hook), and real Bedrock invocation all genuinely work in AWS -
+a real APPROVED completion is expected once pass 2 lands.
+
+- [x] **Pass 2 applied and real document ingestion done, 2026-07-12** -
+      `enable_knowledge_base = true` (`additional_data_access_principals`
+      set to the applier's own ARN, `arn:aws:iam::766354255780:user/eks-admin`,
+      confirmed via `aws sts get-caller-identity` first, per the README's
+      warning). Created: the OpenSearch vector index
+      (`modules/opensearch-index`), the Bedrock Knowledge Base
+      (`5X1FSQTHZG`) + S3 data source (`GDHLU6LSCM`). Hit one transient,
+      not-a-bug issue: the very first apply's `opensearch_index` creation
+      got a 403 (`authorization_exception`) immediately after the AOSS
+      access-policy update in the same apply - AOSS data-access policy
+      propagation lag, not a real error; confirmed the policy was already
+      correct via `get_access_policy`, and a bare re-`plan`/`apply` (3 to
+      add, 1 to change - the policy/Lambda changes had already landed)
+      succeeded clean. **Real document ingestion**: uploaded the same 4
+      mock-fund commentary texts `chroma_store.py` already seeds into
+      Chroma (`doc_eqg1`/`doc_smc3`/`doc_inc2`/`doc_bln4`) as `.txt` files
+      to the KB's S3 bucket, `start_ingestion_job` - `COMPLETE`, `4
+      scanned, 4 indexed, 0 failed`. **Final live re-verification**: the
+      exact same INC2 `invoke_agent_runtime` call now returns
+      `succeeded=true, escalated=false, graph_status=completed,
+      compliance_attempts=3` with a real synthesized report (real NAV/
+      Alpha/Beta/Sharpe/etc. from DynamoDB plus real manager commentary
+      retrieved from the Knowledge Base) - the first genuine APPROVED
+      end-to-end completion of the deployed AgentCore Runtime, not just a
+      graceful escalation.
+
+- [x] **All 4 mock funds tested live against the deployed Runtime,
+      2026-07-12** - same `invoke_agent_runtime` call, one query per fund
+      (fund performance + manager strategy commentary), all real AWS,
+      post-pass-2:
+
+      | Fund | Result | `compliance_attempts` | Wall time |
+      |------|--------|------------------------|-----------|
+      | EQG1 (Equity Growth) | APPROVED | 1 | 6.9s |
+      | SMC3 (Smallcap, high-risk) | APPROVED | 2 | 11.7s |
+      | INC2 (Fixed Income) | APPROVED | 3 | 11.6s |
+      | BLN4 (Balanced) | APPROVED | 3 | 13.5s |
+
+      All four: `succeeded=true, escalated=false, graph_status=completed`,
+      with real DynamoDB quant metrics correctly matched to the right
+      ticker and real Knowledge-Base-retrieved commentary grounded
+      together with no fabrication (e.g. BLN4's response correctly cited
+      the specific "5% rebalanced from cyclical equities into short-term
+      corporate bonds" detail from its ingested commentary doc). SMC3 and
+      BLN4 needed real revise/re-check cycles to reach APPROVED rather
+      than passing on the first attempt, showing the compliance loop is
+      doing real work, not rubber-stamping. This is the full mock dataset
+      confirmed working end-to-end on Bedrock/Nova Lite, at 7-14s per
+      query versus Ollama's 5-10+ *minutes* baseline (see "Known
+      slow/flaky things in DEV").
+
+- [x] **Streamlit UI: SigV4-backed "Deployed AgentCore Runtime (AWS)" mode
+      added, 2026-07-12** - `src/amc_orchestrator/ui/streamlit_app.py` gained
+      a sidebar "Target" radio (`LOCAL_MODE` / `RUNTIME_MODE`). Runtime mode
+      calls `boto3`'s `invoke_agent_runtime` directly (SigV4-signed, no local
+      server involved at all) - shows AWS region + Agent Runtime ARN inputs
+      instead of the API base URL field, plus a live status badge
+      (`bedrock-agentcore-control`'s `get_agent_runtime`, id parsed from the
+      ARN's last path segment). Both modes return the identical `RfpOutcome`
+      JSON shape, so `render_result` needed no changes.
+
+      **Real bug found and fixed via live browser-driven testing** (per this
+      project's UI-testing convention - `chromium-cli` wasn't available in
+      this environment, so Playwright was installed standalone into the
+      scratchpad and driven via a small Node script instead): a genuine
+      Streamlit widget-lifecycle quirk, reproduced in an isolated 20-line
+      script before touching the real file to rule out anything else being
+      the cause. A `key`-bound widget (e.g. `st.text_input(..., key="aws_region")`,
+      no explicit `value=`) only reliably shows a pre-populated
+      `st.session_state[key]` as its *displayed* value if the widget is
+      instantiated on the **same script run** where that default was first
+      set. Since Local mode is the default target, the Runtime-only widgets
+      only render for the first time on a **later** rerun (after the user
+      switches modes) - and Streamlit rendered them blank instead of picking
+      up the already-correct session_state value (confirmed via a temporary
+      debug probe: `st.session_state["aws_region"]` read back `'us-east-1'`
+      correctly in Python at the exact moment the widget rendered empty in
+      the browser). This surfaced as a real, user-facing failure: entering
+      the real deployed Runtime ARN raised `ValueError: Invalid endpoint:
+      https://bedrock-agentcore-control..amazonaws.com` (empty region).
+      Fixed by passing `value=` explicitly on all three affected
+      `text_input`s (API base URL included, defensively, even though it
+      wasn't observed broken - it only "worked" by coincidence of being the
+      default-rendered branch).
+
+      **Live end-to-end proof, via the actual browser UI, not just
+      `boto3` directly**: Playwright driving headless Chromium against the
+      real running Streamlit app confirmed all 4 steps - default state
+      unchanged, mode switch shows the right fields, entering the real
+      Runtime ARN shows a genuine **"Runtime READY"** badge, and submitting
+      the INC2 example query in Runtime mode returned a real synthesized
+      report (**Approved, 1 compliance attempt, 8.3s**) rendered correctly
+      via the existing result view - screenshotted at each step, zero
+      console errors.
+
+- [x] **Dev environment fully torn down, 2026-07-12** - user-initiated
+      `terraform destroy`. Hit exactly the AWS-standard "won't delete
+      non-empty resources" safety checks on three resources that held real
+      content from this session's testing: the ECR repo (pushed images),
+      the S3 docs bucket (4 ingested commentary files), and the
+      `opensearch_index` (4 ingested vector documents) - ECR/S3 with the
+      real AWS "not empty" errors, the OpenSearch community provider with
+      its own `force_destroy` check. **Root cause of the first retry also
+      failing after adding `force_delete`/`force_destroy = true` to the
+      three modules** (`modules/ecr/main.tf`, `modules/s3-kb-docs/main.tf`,
+      `modules/opensearch-index/main.tf` - now committed, so this is fixed
+      for good on any future destroy, dev/staging/prod all share these
+      modules): `terraform destroy` deletes using each resource's
+      **last-applied state**, not the freshly-edited `.tf` config - a code
+      change to a destroy-relevant flag needs an `apply` to actually land
+      in state before a subsequent `destroy` will honor it. A plain
+      `terraform apply` at that point would have **recreated** the ~30
+      resources already destroyed earlier in the same run (`enable_agent_runtime`/
+      `enable_knowledge_base` were still `true` in tfvars) - the opposite of
+      what was wanted - and a `-target`-scoped apply just for the 3
+      resources hit unrelated pre-existing schema drift on the OpenSearch
+      index's `mappings.fields` that would have forced a destroy+recreate
+      instead of a clean in-place flag update. **Resolved by clearing the
+      content directly via AWS APIs instead of fighting Terraform's
+      incremental-apply semantics**: `ecr batch-delete-image` (all 3
+      digests), S3 `delete_object_versions` (versioning was on, so plain
+      `delete_object` wouldn't have been enough - 4 versions deleted), and
+      a direct SigV4-signed `DELETE` HTTP call to the AOSS collection
+      endpoint's `/kb-default-index` (confirmed AOSS's REST API surface is
+      genuinely limited - `_delete_by_query` 404'd, `_search` 403'd, but
+      `_cat/indices`/`_count`/a direct index `DELETE` all worked; deleting
+      the index outright was actually the correct move anyway, since the
+      goal was removing it, not just its documents). Re-`plan`/`apply`
+      after that succeeded clean: `0 added, 0 changed, 9 destroyed`.
+      **`terraform state list` now empty** - dev has zero AWS resources
+      left; a fresh `terraform apply` (all 3 passes, per this doc's
+      "Per-environment apply" flow) is required before any further
+      dev-environment work in a future session.
+
+### Immediate next step (resume here)
+
+1. Re-apply dev from scratch (all 3 passes - pass 1, then pass 2 with
+   `enable_knowledge_base = true` + document re-ingestion, then pass 3 with
+   `enable_agent_runtime = true` + a fresh `docker build`/`push`, since the
+   image was deleted along with everything else) before any further
+   dev-environment testing - there is currently nothing deployed.
+2. Staging/prod applies (all three deploy bugs found earlier this session
+   were dev-tfvars-only fixes so far - `environments/staging/`/`environments/prod/`
+   still reference the same end-of-life Claude model ID and will need the
+   same `bedrock_model_id`/IAM update before their eventual first apply,
+   though they don't have the `MODEL_PROVIDER` issue since
+   `environment != "dev"` already forces Bedrock for them). Staging/prod
+   will also need their own document ingestion pass once applied - the 4
+   mock-fund commentary texts aren't Terraform-managed, they were a manual
+   `aws s3 cp` + `start_ingestion_job`, so nothing propagates automatically.
+3. The deliberately-deferred Gateway-routed tools / AgentCore Memory graph
+   integration.
+4. **Uncommitted work**: `git status` shows the Terraform/app-code files
+   from this phase plus this session's Dockerfile/dev-tfvars fixes, not yet
+   committed (Phase 01's convention is one commit per milestone - worth
+   committing in logical chunks rather than one giant commit, but wasn't
+   asked to do so yet this session).
+
+**Post-teardown addition (2026-07-12): dev-only S3 Vectors vector-store
+option added.** `environments/dev/variables.tf`'s new `vector_store_backend`
+(`"opensearch"` default, or `"s3_vectors"`) lets dev opt into a new
+`modules/s3-vectors` module (`aws_s3vectors_vector_bucket`/
+`aws_s3vectors_index`, confirmed to exist by running `terraform providers
+schema -json` against the real installed `hashicorp/aws` v6.54.0 provider
+in `environments/dev` - not trusted from the reference blog post alone,
+same M0 precedent as always) instead of the OpenSearch
+index/collection-storage path, as a cheaper option for a disposable,
+frequently-torn-down environment. `environments/staging`/`environments/prod`
+hard-lock the variable to `"opensearch"` via a `validation` block (a loud
+plan-time error beats a silent override at the infra layer, unlike
+`Settings.effective_model_provider`'s app-layer pattern).
+
+Deliberately minimal blast radius, confirmed with the user before
+implementing: only `modules/opensearch-index`'s count and
+`modules/knowledge-base`'s `storage_configuration` block (now `dynamic`,
+picking `OPENSEARCH_SERVERLESS` vs `S3_VECTORS`) became
+backend-conditional; `modules/opensearch-serverless`,
+`modules/opensearch-access-policy`, the `opensearch` provider block, and
+`modules/lambda-tools`' unrelated OpenSearch env var are untouched. Real
+consequence: the OpenSearch Serverless collection itself still gets
+created in dev even when `s3_vectors` is selected (it has other
+consumers), so this saves the vector-index/KB-storage cost, not the
+collection's own baseline cost - a documented trade-off, not an oversight
+(full collection-level gating was scoped out as a separate follow-up, it
+would touch 5 files unrelated to the KB plus one unverified Terraform
+provider-block behavior). Two narrow unknowns are flagged in code
+comments rather than silently assumed: the exact `s3vectors:*` IAM action
+names on the new `S3VectorsDataPlane` statement
+(`modules/iam/knowledge_base_role.tf`) and the `data_type`/
+`distance_metric` values (`modules/s3-vectors/variables.tf`) - both taken
+from AWS's own reference examples, not yet checked against AWS's Service
+Authorization Reference. **Not yet applied to real AWS** - `terraform
+fmt`/`validate` plus a `terraform plan` dry run (staging/prod must show
+zero changes; dev should plan to create `module.s3_vectors` and skip
+`module.opensearch_index`) is the next verification step before dev's
+fresh 3-pass apply (item 1 above).
+
+**Follow-up, same day (2026-07-12): full collection-level gating ("Option
+B").** The user confirmed a real `terraform plan` showed the OpenSearch
+Serverless collection still being created in dev even with
+`vector_store_backend = "s3_vectors"` selected (exactly the documented
+trade-off above), then asked for the deferred full-savings design.
+`modules/opensearch-serverless` and `modules/opensearch-access-policy`
+gained an `enabled` variable (default `true`) with `count = var.enabled ?
+1 : 0` moved *inside* each module rather than onto the module block at the
+root call site - this keeps `module.opensearch_serverless.collection_endpoint`
+a plain singleton-module reference everywhere it's consumed (`providers.tf`'s
+`opensearch` provider block in particular), never a `[0]`-indexed one,
+which HashiCorp's own docs (fetched this session) confirm provider-block
+arguments generally can't depend on. Two things found only by directly
+verifying against the repo, not assumed: (1) no `moved` blocks existed
+anywhere in this Terraform tree - added `moved.tf` in both modules so the
+un-indexed → `[0]` address change is a state rename, not a
+destroy+recreate, on any environment that already had these resources
+applied; (2) `var.opensearch_collection_arn` is consumed unconditionally
+in **three** `modules/iam` files, not the one already fixed for S3 Vectors
+(`knowledge_base_role.tf`) - `lambda_execution_role.tf` and
+`runtime_role.tf` also needed the same `dynamic "statement"` treatment, or
+`terraform apply` would fail outright in dev's `s3_vectors` mode (AWS
+rejects an IAM statement with an empty-string ARN resource). A Plan-mode
+design-review agent caught both gaps; both were independently confirmed via
+`grep` before being trusted. `providers.tf`, `lambda-tools`, and root
+`outputs.tf` needed **no changes** at all, since they already just forward
+`module.opensearch_serverless`'s outputs, which now safely resolve to `""`
+when disabled. Timing note: dev, staging, and prod all currently have
+empty Terraform state (confirmed via `terraform state list` in dev and the
+absence of `backend.hcl` in staging/prod), so the `moved`-block migration
+path isn't live today for any of the three - included anyway as correct,
+cheap defensive design. **Not yet applied to real AWS** - same
+`fmt`/`validate`/`plan` verification as above is the next step.
+
+**Live dev re-deploy, same day (2026-07-12): two real bugs found and fixed
+mid-apply.** The user started re-provisioning dev from scratch. AgentCore
+Memory created fine (~2m42s), then the apply hit two real, sequential
+errors on `module.knowledge_base[0]` - both fixed and re-verified, neither
+caught by `terraform validate`/`plan` beforehand since both only surface
+with concrete values a real apply produces:
+
+1. **`aws_bedrockagent_knowledge_base`'s `s3_vectors_configuration` rejects
+   `index_arn` combined with `vector_bucket_arn`/`index_name`** -
+   "Invalid Attribute Combination". A `ConflictsWith` constraint the
+   provider schema dump used to design this block only showed as three
+   independently-optional attributes, not the real AWS API rule. Fixed by
+   using `index_arn` alone (`modules/s3-vectors` already computes it
+   directly) - simpler than the pair anyway. Removed the now-unused
+   `s3_vectors_bucket_arn`/`s3_vectors_index_name` variables from
+   `modules/knowledge-base` and the corresponding args from all three
+   environments' `module.knowledge_base` call sites.
+2. **The `S3VectorsDataPlane` IAM statement's action names were wrong**:
+   `AccessDenied` on `s3vectors:GetVectors` - the KB service reads from the
+   index at *creation* time, not just later ingestion, so this fired
+   immediately once the storage-config bug above was fixed. The original
+   guess (singular `GetVector`/`PutVector`/`DeleteVector`, from a
+   third-party reference, flagged as unverified in the prior session's log
+   entry above) was wrong - real actions are plural
+   (`GetVectors`/`PutVectors`/`DeleteVectors`), confirmed against AWS's own
+   IAM policy examples
+   (`docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-iam-policies.html`)
+   this time, not a blog post. `QueryVectors`/`ListVectors`/`GetIndex`/
+   `ListIndexes` were already correct. The same apply's earlier success
+   creating the S3 Vectors bucket+index also confirms
+   `modules/s3-vectors/variables.tf`'s `data_type = "float32"`/
+   `distance_metric = "cosine"` defaults are valid - only their optimality
+   for retrieval quality (vs. just validity) remains unconfirmed, a
+   separate non-blocking question.
+
+`terraform validate` re-confirmed clean on all three environments after
+both fixes. **Dev's re-apply completed successfully** (all three passes -
+`enable_agent_runtime` was temporarily set `false` for pass 1/2, a fresh
+image built/pushed to the recreated ECR repo, then flipped back `true` for
+pass 3) - `terraform output` confirmed `opensearch_collection_arn`/
+`opensearch_collection_endpoint` both empty, live proof of zero OpenSearch
+resources. The 4 mock-fund commentary docs were re-uploaded to the S3 docs
+bucket and ingested cleanly (4 scanned, 4 indexed, 0 failed - same texts as
+`chroma_store.py`'s `_MOCK_COMMENTARY`, see that file for the exact
+content). **Full live end-to-end proof, via `boto3`'s `invoke_agent_runtime`
+(the AWS CLI installed here is still too old for `bedrock-agentcore`
+commands, per the existing note in `docs/user_guide.md`)**: the INC2 query
+returned `succeeded=true, escalated=false, compliance_attempts=1,
+graph_status=completed`, with real DynamoDB quant metrics (NAV $52.10,
+Beta 0.35, etc.) and real S3-Vectors-Knowledge-Base-retrieved commentary
+("reduced duration risk... central bank updates... exceptionally low Beta
+of 0.35" - an exact match to the uploaded `doc_inc2.txt` text) - the first
+genuine APPROVED completion proving the whole S3 Vectors backend works
+end-to-end in AWS, not just that Terraform applied cleanly.
+
+Provisions every AWS resource the deployed system needs (AgentCore
+Runtime/Gateway/Memory, ECR, DynamoDB, OpenSearch Serverless + Bedrock
+Knowledge Base, Lambda tool stubs, IAM, observability) via modular
+Terraform (`infra/terraform/`), one root module per environment
+(`environments/{dev,staging,prod}/`), Terraform v1.15.7. Confirmed all
+required resource types exist natively in `hashicorp/aws` (no
+CloudFormation/awscc needed) by reading the provider's actual source docs,
+following this project's own M0 precedent of verifying against real
+sources instead of guessing from blog posts.
+
+**Scope is Terraform/infra only.** The app-code changes needed to actually
+run in AgentCore — an AgentCore-compliant HTTP entrypoint, swapping
+`data/sqlite_store.py`/`data/chroma_store.py` for DynamoDB/OpenSearch, a
+real Dockerfile — are a separate, not-yet-started follow-on task. This
+also means the `.env.staging.example`/`.env.prod.example` comments
+guessing "Snowflake/Redshift" and "Amazon OpenSearch" as the eventual
+data-layer swap target are now stale/wrong — the actual target is
+DynamoDB + OpenSearch Serverless, fixed in those files as part of this
+milestone.
+
+**Locked-in architecture decisions** (see `infra/terraform/README.md` for
+the full reasoning on each):
+- Single AWS account; dev/staging/prod isolated by naming + separate
+  Terraform state, not separate AWS accounts.
+- AgentCore Runtime network mode `PUBLIC`, not `VPC` — `VPC` mode hits a
+  confirmed open AWS bug (ENIs get locked, `terraform destroy` hangs
+  forever; `terraform-provider-aws` issue #45099, closed "not planned").
+- DynamoDB (pay-per-request) replaces SQLite for quant metrics.
+- Gateway/Runtime auth is AWS IAM (SigV4), not Cognito/JWT.
+- `aws_bedrockagentcore_agent_runtime` needs a container image that
+  doesn't exist yet at infra-build time — Terraform creates the ECR repo
+  only; the runtime resource is applied in a documented later pass once an
+  image is pushed out-of-band. Terraform never runs `docker build`.
+- OpenSearch Serverless has no native Terraform vector-index resource in
+  `hashicorp/aws` (confirmed against AWS's own "Deploy Amazon OpenSearch
+  Serverless with Terraform" blog, which stops at collection+policies) —
+  index creation uses the `opensearch-project/opensearch` community
+  provider instead, signed for AOSS specifically
+  (`aws_signature_service = "aoss"`, not its "es" default).
+- A dependency cycle surfaced during build: `modules/iam` needs the
+  OpenSearch collection's ARN to scope its role policies, but the
+  collection's data-access policy needs those same roles' ARNs as its
+  `Principal` list. Fixed by splitting the data-access policy into its own
+  `modules/opensearch-access-policy`, applied after both `modules/iam` and
+  `modules/opensearch-serverless` — worth knowing before "simplifying" the
+  module list back down.
+- Every environment applies in up to three passes (`enable_knowledge_base`
+  and `enable_agent_runtime` variables, both default `false`) because a
+  handful of resources genuinely can't exist before their prerequisites
+  do — see `infra/terraform/README.md`'s "three phases" section before
+  assuming a single `terraform apply` should create everything.
+
+**Verified so far**: `terraform fmt -recursive -check` clean and
+`terraform validate` (no AWS credentials needed) passes on `bootstrap/`
+and all three `environments/*` root modules — confirms every resource
+argument used against the real provider schema (provider resolved to
+`hashicorp/aws` v6.54.0, `opensearch-project/opensearch` v2.3.2,
+`hashicorp/archive` v2.8.0).
+
+**Real `terraform plan` run against the user's AWS account (dev, pass 1),
+2026-07-11**: 21 resources planned to add, 0 to change/destroy — the
+overall graph and module wiring is sound. Caught one real bug `validate`
+couldn't: `aws_opensearchserverless_collection`/`_security_policy`/
+`_access_policy` names are capped at 32 characters by AWS, and
+`amc-orchestrator-dev-kb-vectors` plus the `-enc`/`-net`/`-data` policy
+suffixes exceeded it (35-36 chars). Fixed in
+`modules/opensearch-serverless/main.tf`: `collection_name` is now built
+with a guaranteed-safe budget (27 chars, leaving room for the longest
+`-data` suffix) and a short suffix (`-vec` not `-kb-vectors`); if
+`name_prefix` is long enough that this would still overflow (e.g.
+`staging`'s longer name), a 6-char hash of the untruncated name is
+appended rather than naively `substr()`-truncating — a naive truncation
+risks two environments colliding if truncation cuts off the exact part
+that made them different. Re-`validate`d clean after the fix; **not yet
+re-`plan`ned** against real AWS to confirm this specific error is fully
+resolved (the next natural verification step, before applying for real).
+
+**Pass 1 applied to real AWS (dev), 2026-07-11 - fully live-verified, not
+just planned**: IAM roles (trust policies confirmed correctly scoped per
+service principal), ECR (empty, scan-on-push on), DynamoDB (`ACTIVE`,
+`PAY_PER_REQUEST`), OpenSearch Serverless collection (`ACTIVE`, name fits
+the 32-char limit after the fix above), S3 docs bucket, both Lambda tool
+stubs (real `invoke` calls returned the expected placeholder JSON),
+AgentCore Gateway + both targets (`READY`), AgentCore Memory + semantic
+strategy (`ACTIVE`), CloudWatch dashboard/alarms - all confirmed via live
+`aws`/`boto3` calls against the account, not just `terraform state list`.
+Found and fixed one more real bug this way: the two Lambda-error alarms
+were double-prefixed (`modules/observability/main.tf` re-prepending
+`name_prefix` onto `each.value`, which was already the fully-prefixed
+Lambda function name) - `terraform plan` after the fix showed exactly
+`2 to add, 0 to change, 2 to destroy`, applied clean.
+
+**App-code follow-on task done, 2026-07-11** (the work this unblocked):
+an AgentCore Runtime entrypoint, a DynamoDB/Bedrock-Knowledge-Base data-layer
+swap, and a Dockerfile - closing the gap that had `enable_agent_runtime`
+gated off. Scope deliberately kept smaller than it could have been (user
+confirmed): agents still call `get_fund_performance`/`search_fund_commentary`
+as regular in-process `@tool` functions, just repointed at DynamoDB/a
+Bedrock Knowledge Base instead of SQLite/Chroma - the Gateway's Lambda
+targets stay placeholders and AgentCore Memory stays unused by the graph,
+both a separate, larger follow-on.
+
+- `config/settings.py`: `data_backend`/`effective_data_backend` added,
+  mirroring `model_provider`/`effective_model_provider` exactly (DEV can
+  opt in, STAGING/PROD always use `"aws"`).
+- New `data/dynamodb_store.py`, `data/knowledge_base_store.py` (calls
+  Bedrock's managed `Retrieve` API against the Knowledge Base Terraform
+  already built, not hand-rolled OpenSearch k-NN + our own embedding
+  calls), and thin dispatch facades `data/quant_store.py`/`data/qual_store.py`
+  - only 4 existing files touched to call the facade instead of the
+  concrete store (`tools/quant_tools.py`, `tools/qual_tools.py`, `cli.py`,
+  `api/main.py`); `sqlite_store.py`/`chroma_store.py` themselves untouched.
+- New `src/amc_orchestrator/runtime_entrypoint.py`
+  (`bedrock_agentcore.runtime.BedrockAgentCoreApp`, `@app.entrypoint`),
+  reusing `build_rfp_graph`/`summarize_result`/`summarize_exception`
+  exactly as `cli.py`/`api/routes/rfp.py` already do - no new translation
+  logic, same resilience contract.
+- New repo-root `Dockerfile` - `linux/arm64` (AgentCore Runtime requires
+  Graviton), `uv`-based, matching Strands' own AgentCore deployment guide's
+  pattern.
+- `infra/terraform/modules/agentcore-runtime` + all three `environments/*/main.tf`:
+  added `BEDROCK_KNOWLEDGE_BASE_ID` to the runtime's `environment_variables`.
+
+**Verified for real, not just unit-tested**: `uv run python -m pytest
+tests/unit -q` - **64 passed**. Then a live local smoke test:
+`uv run python -m uvicorn amc_orchestrator.runtime_entrypoint:app` really
+running, `GET /ping` returning `Healthy`, a missing-`prompt` payload
+correctly rejected, and **one real end-to-end `POST /invocations` call
+against real Ollama actually completing** (`succeeded=true,
+escalated=false, graph_status=completed`, a real compliant synthesized
+report for the INC2 query) - proof the entrypoint genuinely works through
+the real AgentCore HTTP contract, not just through mocks. `docker build
+--platform linux/arm64 ...` was **not verified** - Docker Desktop's daemon
+wasn't running on this machine this session; the Dockerfile itself is
+unverified by an actual build, flagged rather than assumed working.
+
+**Environment quirk found, worth knowing**: on this machine, `uv run
+pytest ...` (the `.exe` console-script launcher) misresolves
+`amc_orchestrator` imports to a sibling `Phase-01` directory for some
+(not all) test modules - a pre-existing, unrelated launcher issue, not
+caused by any code here. `uv run python -m pytest ...` does not have this
+problem and resolves correctly every time - **use that form, not
+`uv run pytest`, on this machine.**
+
+Natural next step: push a real image to the ECR repo pass 1 already
+created, set `enable_agent_runtime = true` (and `container_image_uri`),
+apply - the first real, invokable AgentCore Runtime. Real AWS action
+(image push + apply), should be confirmed with the user first, not
+auto-run.
+
+### Auto-sync RAG pipeline: S3 → Knowledge Base ingestion (2026-07-13)
+
+Closed the "manual ingestion" gap flagged throughout this doc and in
+`data/knowledge_base_store.py`'s `ensure_seeded()` docstring - the *initial*
+document upload to the S3 docs bucket is still a separate, manual/CI step
+(unchanged), but every upload/delete **after** that now auto-syncs the
+Knowledge Base without a manual `start_ingestion_job` call. Adapted from a
+reference article's S3→SQS→Lambda→`bedrock-agent:StartIngestionJob` pattern
+(dev.to/suhas_mallesh) to this repo's own conventions - confirmed via a
+full-repo search that no SQS queue or `aws_s3_bucket_notification` existed
+anywhere before this, a net-new capability, not a fix.
+
+New: `infra/terraform/modules/kb-ingestion-sync/` (SQS queue + DLQ, S3
+bucket notification, Lambda + event source mapping - `batch_size=10` +
+`maximum_batching_window_in_seconds=300` is the sole debounce mechanism,
+so many rapid S3 events collapse into one ingestion job since Bedrock only
+allows one running job per data source at a time; the reference article's
+extra SQS-level `delay_seconds` was deliberately dropped as redundant with
+this AWS-native mechanism - user-confirmed choice). Lambda handler
+(`sync_src/handler.py`) catches `ConflictException` from a still-running
+job as a success (ingestion is incremental, the running job already covers
+the new files), any other `ClientError` re-raises so SQS redrives to the
+DLQ after 3 attempts.
+
+**IAM decision (user-confirmed, surfaced explicitly rather than picked
+silently)**: `modules/iam/kb_ingestion_sync_role.tf`'s
+`bedrock:StartIngestionJob` statement is wildcarded to
+`knowledge-base/*` rather than scoped to the real KB ARN - the real ARN
+doesn't exist until Pass 2 (`module.knowledge_base`), but this role is
+created in Pass 1 (`modules/iam`), and scoping it precisely would recreate
+the exact iam↔knowledge_base module cycle already solved once for
+OpenSearch's access policy (see `modules/opensearch-access-policy`'s own
+history above). Accepted trade-off: grants the ability to *trigger*
+ingestion jobs account-wide, not read/write KB content. The role's SQS
+permissions use the same predictable-ARN-by-naming-convention precedent as
+`lambda_execution_role.tf`'s `CloudWatchLogsOwnFunctions` statement, so no
+new cross-module ARN wiring was needed there either.
+
+DLQ failures alert through the *existing* shared `aws_sns_topic.alarms` in
+`modules/observability` (new `kb_ingestion_dlq_depth` alarm, gated on
+`var.kb_ingestion_dlq_name != ""`) rather than a new topic - user-confirmed,
+one place to subscribe.
+
+Wired into all three environments identically (`module.kb_ingestion_sync`,
+`count = var.enable_knowledge_base ? 1 : 0`, alongside `module.knowledge_base`
+in the existing Pass-2 block) - modules stay environment-agnostic per this
+repo's own "Adding a 4th environment" convention, only tfvars differ.
+`infra/terraform/README.md`'s Pass-2 section and Settings-mapping table
+updated to reflect ongoing sync now being automatic.
+
+**Verified so far**: `terraform fmt -recursive` clean. `terraform validate`
+- see below for per-environment result. **Not yet applied to real AWS** -
+per this project's own discipline (3+ real apply-time bugs so far were
+never caught by `validate` alone), a real `terraform plan` dry-run against
+dev and an actual apply + live test (drop a file in the docs bucket, watch
+`start_ingestion_job` fire) are the next steps, both requiring the user's
+explicit go-ahead before running.
+
+## Phase 03 — CI/CD Implementation (GitHub Actions)
+
+Started 2026-07-13, same session as the kb-ingestion-sync work above. User
+requested a detailed analysis + implementation plan first (Plan Mode), then
+approved it after 4 rounds of `AskUserQuestion` locking in the design: OIDC
+federated auth (not long-lived keys), fully manual deploy triggers
+everywhere (no auto-deploy on merge, not even dev), build-once/promote-the-
+same-image across environments (not rebuild-per-env), and no GitHub
+Environment required-reviewer gate on staging/prod (avoids the
+solo-maintainer deadlock where GitHub won't let the person who triggered a
+run approve their own deployment).
+
+**Repo hosting is explicitly out of scope** - the user is handling GitHub
+repo creation/push separately; `git remote -v` was empty at the start of
+this work and still is. Everything below is designed to work once `origin`
+exists, not verified against a real GitHub Actions run yet (can't be,
+without a pushed repo) - **`terraform fmt`/`validate` are the only things
+actually verified so far** (see below), same as every other not-yet-applied
+piece of Terraform in this project.
+
+### What was built
+
+- **`infra/terraform/github-oidc/`** - new standalone root module (sibling
+  to `bootstrap/`/`environments/*`, not nested in either - reuses the
+  existing state bucket as its own backend key rather than local state,
+  since unlike `bootstrap/` itself this module has no chicken-and-egg
+  problem: the bucket already exists by the time this applies).
+  - `aws_iam_openid_connect_provider` for
+    `token.actions.githubusercontent.com`, thumbprint fetched live via
+    `data "tls_certificate"` rather than hardcoded (the
+    Terraform-documented pattern for this resource - avoids going stale on
+    a CA rotation, a real historical event for this exact provider).
+  - One shared, read-only `plan` role (AWS managed `ReadOnlyAccess`,
+    trusted only for `sub = "repo:<org>/<repo>:pull_request"` tokens) -
+    used by `pr-validate.yml`'s `tf-plan` job on every PR, including from
+    less-trusted pushes. Deliberately AWS-managed rather than hand-rolled:
+    an incomplete custom read policy would silently break `terraform plan`
+    on whatever action got missed, the same class of bug this project has
+    already hit once for real (`s3vectors:GetVectors` singular-vs-plural,
+    see the Phase 02 history above) - `ReadOnlyAccess` guarantees zero
+    mutating actions regardless of completeness.
+  - Three per-environment `deploy-<env>` roles (write-scoped, trusted only
+    for `sub = "repo:<org>/<repo>:environment:<env>"` tokens - GitHub only
+    mints that claim for a job that explicitly declares
+    `environment: <env>`, so even a misconfigured workflow can't get a
+    PR-triggered run to assume one). Permissions scoped by resource-name-
+    prefix (`amc-orchestrator-<env>-*`) everywhere the target AWS service's
+    ARN format allows it, following the exact precedent already in
+    `modules/iam/lambda_execution_role.tf`'s `CloudWatchLogsOwnFunctions`
+    statement - this is what keeps the CI identity from quietly
+    undermining the project's existing dev/staging/prod isolation model
+    (naming convention + separate state, not separate AWS accounts, per
+    the Phase 02 "locked-in architecture decisions" above). One deliberate
+    exception: `deploy-staging`/`deploy-prod` also get narrow read-only
+    access to **dev's** ECR repo specifically (not wildcarded), required
+    for the promote step below. A handful of action names (S3 Vectors/
+    AgentCore control-plane calls) are flagged in code comments as
+    best-effort/unverified, the same honest-uncertainty pattern already
+    used for `S3VectorsDataPlane`'s real incident.
+- **`.github/workflows/pr-validate.yml`** - automatic on every PR to
+  `main`, path-filtered via `dorny/paths-filter` so unrelated changes skip
+  irrelevant jobs: ruff/mypy/`pytest tests/unit` for app changes, an arm64
+  Docker build sanity check (QEMU-emulated, `--output=type=cacheonly`,
+  never pushes) for Docker-relevant changes, and `terraform fmt`/`validate`
+  (no credentials) + `terraform plan` (the read-only OIDC role, posted/
+  upserted as a PR comment per environment) for Terraform changes. Never
+  applies, never pushes an image - the explicit design invariant that
+  makes it safe to run unattended on every PR.
+- **`.github/workflows/deploy.yml`** - `workflow_dispatch` only, the *only*
+  workflow that ever touches AWS. Three jobs: `build-and-push` (dev target
+  only - builds fresh from source, tags with the full git SHA, pushes),
+  `promote` (staging/prod targets - `crane copy`s that exact already-built
+  dev image into the target env's own ECR repo by digest, no rebuild, no
+  QEMU needed since crane never executes the image), `terraform-apply`
+  (declares `environment: <input>` so GitHub's Environment-scoped
+  variables and deployment-branch restriction apply, resolves the image
+  URI and passes it via `-var="container_image_uri=..."` rather than
+  committing it to tracked tfvars - a convention change from how dev's
+  tfvars used to work, see below). A `promote_image` boolean input lets an
+  operator run a staging/prod pass-1/pass-2-only apply through this same
+  generic workflow without forcing a meaningless promotion when no image
+  is involved yet.
+- **`.dockerignore`** added (didn't exist before) - excludes `.venv/`,
+  `.git/`, `.github/`, `.claude/`, `data/`, `local_dev.db`, `docs/`,
+  `infra/`, `tests/`, caches, `environments/.env*`.
+- **tfvars changes**: staging/prod's `bedrock_model_id` fixed off the EOL
+  Claude model (`amazon.nova-lite-v1:0`, matching dev's already-proven
+  value - staging/prod had never been applied, so this was silently stale
+  until now, not yet a live bug). dev's `container_image_uri` cleared to
+  `""` (normalizing it onto the same `-var`-at-apply-time convention
+  staging/prod now use, rather than the real, environment-specific image
+  tag it used to hardcode) - user-confirmed this touches a live
+  environment's tracked config but is a no-op at the AWS level (same
+  image URI, just supplied differently at the next apply). All three
+  tfvars got placeholder comments marking exactly where each
+  environment's `deploy-<env>` role ARN goes in
+  `additional_data_access_principals`, once `github-oidc/` is applied.
+- **`docs/ci_cd_runbook.md`** (new) - the one-time GitHub-side manual setup
+  (Environments, deployment-branch restriction, repo/Environment
+  variables) and the full staging/prod first-ever-rollout sequence through
+  `deploy.yml`, since neither has ever been applied. Deliberately NOT
+  Terraform-managed via the `integrations/github` provider - would need
+  its own GitHub PAT/App credential, a new credential surface not worth it
+  for a one-time, rarely-changed setting on a single-maintainer project.
+- `infra/terraform/README.md` and this file's docs siblings
+  (`docs/architecture.md`, `docs/user_guide.md`) updated with a matching
+  Phase 03 section each.
+
+### Design decisions surfaced explicitly, not picked silently
+
+Two practical gotchas came up mid-design and were resolved with the user
+rather than assumed:
+
+1. **GitHub Environment required-reviewer gates don't let the triggering
+   user approve their own deployment.** For a true solo maintainer, adding
+   one to staging/prod would deadlock every deploy unless a second GitHub
+   account is always on hand to click approve. User chose no
+   required-reviewer gate at all - the manual `workflow_dispatch` trigger
+   + OIDC role-scoping + restricting each Environment's deployment branch
+   to `main` is the safety net instead.
+2. **The shared read-only plan role can't be Environment-scoped without
+   undermining its own trust-policy safety property.** If `tf-plan`
+   declared `environment: <env>` (to read Environment-scoped variables,
+   the general preference for `deploy.yml`'s jobs), its OIDC token would
+   carry the same `sub` claim shape the deploy roles trust, weakening "a
+   PR run can never carry an `environment:` claim." Resolved by keeping
+   `AWS_PLAN_ROLE_ARN`/`TF_STATE_BUCKET` as **repo-level** GitHub
+   variables and never declaring `environment:` on that job at all -
+   `vars.AWS_DEPLOY_ROLE_ARN` stays Environment-scoped since `deploy.yml`'s
+   jobs are supposed to carry that context.
+
+### Verified so far
+
+`terraform fmt -check -recursive` (from `infra/terraform/`) and
+`terraform validate` (via `terraform init -backend=false`, no AWS
+credentials) both pass clean on the new `github-oidc/` module and on all
+three `environments/{dev,staging,prod}` after the tfvars edits. Both
+workflow YAML files parse cleanly (`yaml.safe_load`). **Nothing has been
+applied to real AWS yet, and no GitHub Actions run has ever fired** - the
+repo still has no `git remote` configured (the user's own next step, out
+of scope for this work), and even once pushed, `infra/terraform/github-oidc/`
+still needs a one-time local `terraform apply` (chicken-and-egg - CI can't
+create the IAM role it needs to authenticate) before either workflow can
+do anything beyond `pr-validate.yml`'s no-credentials jobs. See
+`docs/ci_cd_runbook.md` for the exact sequence.
+
+### Progress, 2026-07-14 (new session)
+
+Step 0 and step 1 of the resume plan below are now **done**, live, for real:
+
+- **Repo pushed to GitHub**: `https://github.com/kombaraj-ai/AMC-RFP-Phase3.git`.
+  Local branch renamed `master` → `main` first (matches this doc's/the
+  workflows' assumption), pushed with `-u`, `origin/main` tracking confirmed.
+- **`infra/terraform/github-oidc/` applied to real AWS**: `backend.hcl`
+  (gitignored, bucket `amc-orchestrator-tfstate-766354255780`,
+  key `github-oidc/terraform.tfstate`) and `terraform.tfvars`
+  (`github_org = "kombaraj-ai"`, `github_repo = "AMC-RFP-Phase3"` - tracked
+  in git, no secrets, same convention as the environments' own tfvars)
+  created, `terraform init -backend-config=backend.hcl` +
+  `plan`/`apply` - **9 resources added, 0 errors**. Captured outputs:
+  - `plan_role_arn` = `arn:aws:iam::766354255780:role/amc-orchestrator-gha-plan-role`
+  - `deploy_role_arns.dev` = `arn:aws:iam::766354255780:role/amc-orchestrator-dev-gha-deploy-role`
+  - `deploy_role_arns.staging` = `arn:aws:iam::766354255780:role/amc-orchestrator-staging-gha-deploy-role`
+  - `deploy_role_arns.prod` = `arn:aws:iam::766354255780:role/amc-orchestrator-prod-gha-deploy-role`
+- `environments/dev/terraform.tfvars`'s `additional_data_access_principals`
+  updated to add the `deploy-dev` role ARN alongside the existing human
+  applier ARN (so future CI-triggered dev applies get AOSS data-plane
+  access too) - **edited but not yet applied** (see finding below).
+  `staging`/`prod` tfvars deliberately left with their `[]` placeholders -
+  not their turn yet per the documented Pass 2 rollout order.
+
+**Real, undocumented finding this session: dev is currently torn down to
+zero AWS resources**, and this is *not* the same as the 2026-07-12
+teardown/redeploy already logged above. Confirmed two independent ways:
+`terraform state pull` against the real S3 backend
+(`environments/dev`) shows `"resources": []`, and a direct
+`aws ecr describe-repositories --repository-names amc-orchestrator-dev-agent`
+returns `RepositoryNotFoundException`. `aws s3api list-object-versions` on
+`dev/terraform.tfstate` shows the state shrinking from 192KB to 1.9KB
+across ~10 versions between **2026-07-13 13:58 and 15:49 UTC** - i.e. a
+second, undocumented `terraform destroy` happened on 2026-07-13, the same
+day the Phase 03 CI/CD design/build work landed, and nothing has
+redeployed dev since. Right AWS account confirmed
+(`766354255780`, `user/eks-admin`, matches every prior session). Given
+this, the dev tfvars edit above is a real, correct, but **currently
+inapplicable** change - there's no live dev environment to update, it'll
+take effect whenever dev is next deployed from scratch.
+
+**Not yet committed to git**: `infra/terraform/github-oidc/terraform.tfvars`
+(new, untracked) and `infra/terraform/environments/dev/terraform.tfvars`
+(modified). `docs/i1.png` (a GitHub quick-setup screenshot, used once to
+read the repo URL) is also untracked - safe to delete, not needed by the
+project.
+
+### GitHub Environments + first real `deploy.yml` dev rollout, 2026-07-14 (same session, continued)
+
+Steps 2-3 of `docs/ci_cd_runbook.md` (the three GitHub Environments,
+`AWS_PLAN_ROLE_ARN`/`TF_STATE_BUCKET` repo variables, per-Environment
+`AWS_DEPLOY_ROLE_ARN`) were completed manually via the GitHub web UI (no
+`gh` CLI available in this dev environment, confirmed absent in both bash
+and PowerShell). User then dispatched `deploy.yml` for `environment=dev`
+repeatedly to redeploy the torn-down environment from scratch - this
+surfaced a real, never-before-exercised ordering bug plus **seven rounds**
+of real IAM gaps in the `deploy-dev` role, each found via an actual failed
+CI-scoped apply, not guessed. Every fix was applied directly to
+`infra/terraform/github-oidc` (a local `terraform apply`, since that module
+is the one piece of CI infra that bootstraps itself) and pushed to `main`
+before the next dispatch. This is the single most valuable real-world
+lesson from Phase 03: **every prior `environments/dev` apply in this
+project's history ran under the user's own broad `eks-admin` credentials,
+never the actual least-privilege `deploy-<env>` role Terraform itself
+creates for CI** - so this was the first time that role's real permissions
+were ever exercised end-to-end, and it needed real hardening, not just a
+plan-time check.
+
+**Bug found and fixed first, `.github/workflows/deploy.yml`**: `build-and-push`
+(dev) and `promote` (staging/prod) both ran *before* `terraform-apply`,
+which normally creates the ECR repo - fine as long as the environment
+already had one from a prior apply (true every time before this session),
+but dev was genuinely torn down to zero resources, so the very first
+dispatch failed pushing to a repo that didn't exist yet. Fixed with a new
+`ensure-ecr` job (`terraform apply -target=module.ecr` first, on every
+dispatch - idempotent, so it's a no-op once the repo exists) that
+`build-and-push`/`promote`/`terraform-apply` all now depend on correctly.
+**Explicitly Terraform-only, not a raw `aws ecr create-repository` call**
+per the user's own stated preference - see the standing feedback memory on
+this - since an out-of-band-created resource would make the next full
+apply fail with "already exists" against a repo Terraform doesn't know
+about.
+
+**Seven rounds of real IAM gaps found and fixed, in the order they
+surfaced** (each confirmed via `terraform plan`/`apply` against the real
+`github-oidc` state after the fix, before the next dispatch):
+
+1. `bedrock-agentcore:CreateWorkloadIdentity` missing entirely (the Gateway
+   needs it against the account's singleton `workload-identity-directory/default`).
+2. `logs:DescribeLogGroups` granted but scoped to name-prefixed ARNs - AWS
+   always resolves this specific action to a generic `log-group::log-stream:`
+   ARN that only matches `Resource = "*"`, a real AWS quirk, not an
+   oversight in the original scoping.
+3. `s3:GetBucketCORS` missing - `aws_s3_bucket`'s Read function
+   unconditionally calls several `Get*` sub-config APIs on every refresh
+   regardless of whether this project declares the corresponding block.
+   Rather than keep discovering these one at a time, read the actual
+   installed `terraform-provider-aws` v6.54.0 source
+   (`resourceBucketRead` in `internal/service/s3/bucket.go`, fetched live)
+   and pre-empted the rest: `GetBucketWebsite`, `GetAccelerateConfiguration`,
+   `GetBucketRequestPayment`, `GetBucketLogging`, `GetReplicationConfiguration`,
+   `GetBucketObjectLockConfiguration` - action names verified against AWS's
+   own IAM policy-generator dataset
+   (`awspolicygen.s3.amazonaws.com/js/policies.js`), not guessed (several
+   deliberately omit "Bucket", matching the project's own precedent for
+   `GetLifecycleConfiguration`/`GetEncryptionConfiguration`).
+4. The workload-identity fix from round 1 still 403'd on a second real
+   apply - AWS actually authorizes `CreateWorkloadIdentity` against the
+   *sub-resource being created*
+   (`.../workload-identity-directory/default/workload-identity/<id>`), not
+   the bare directory ARN the first attempt granted. Same apply also
+   needed `lambda:ListVersionsByFunction` (`aws_lambda_function`'s Read
+   always checks the latest published version).
+5. `lambda:GetFunctionCodeSigningConfig` - also read the provider's actual
+   `function.go` source this time rather than waiting for a further
+   round-trip; confirmed it's the only other unconditional call for
+   Zip-package-type functions in commercial partitions (this project's
+   case).
+6. `CreateAgentRuntime` implicitly provisions a default runtime endpoint
+   too (`bedrock-agentcore:CreateAgentRuntimeEndpoint` + Get/Update/Delete/List
+   siblings, missing entirely - already covered by the existing `runtime/*`
+   wildcard, unlike round 1's un-wildcarded ARN). Same apply needed
+   `lambda:TagResource`/`UntagResource`/`ListTags` on the
+   `LambdaEventSourceMappings` statement (the kb-ingestion-sync event
+   source mapping is tagged like everything else this project creates).
+7. `CreateAgentRuntime` also auto-creates *and tags* its own workload
+   identity - `bedrock-agentcore:TagResource`/`UntagResource`/`ListTagsForResource`
+   were missing from the `AgentCoreWorkloadIdentity` statement specifically
+   (the `AgentCoreRuntimeGatewayMemory` statement's own `TagResource` grant
+   doesn't apply, since its `resources` list is runtime/gateway/memory
+   ARNs, not workload-identity ones).
+
+**A real incident, not just a plan-time gap, surfaced fixing round 7**:
+adding those three tag actions pushed the combined inline policy over
+AWS's real `LimitExceeded: Maximum policy size of 10240 bytes exceeded`. A
+first fix attempt split the one inline policy into two smaller
+`aws_iam_role_policy` resources - **this did not work**, because AWS's
+10,240-byte inline-policy limit is an **aggregate across all inline
+policies on a single role**, not per-document (confirmed against AWS's own
+IAM quotas reference page, fetched live - "the total aggregate policy
+size... per entity can't exceed" 10,240 bytes). The partial apply that
+resulted left real broken state: dev happened to fit under the aggregate
+by luck, staging ended up with only one of its two new inline policies
+attached, and **prod ended up with neither** - confirmed directly via
+`aws iam list-role-policies`/`list-attached-role-policies` before fixing,
+not assumed. **Properly fixed** by switching to customer-managed policies
+(`aws_iam_policy` + `aws_iam_role_policy_attachment`, three-way split by
+service area: core / agentcore+AI / compute+messaging) - managed policies
+have their own separate 6,144-byte limit that applies *per policy*, not
+aggregated, and a role can attach up to 10 by default, giving real
+headroom (largest split policy ended up ~4.3KB) for whatever the next
+round of real-apply-driven fixes turns out to be. Re-verified via
+`aws iam list-attached-role-policies` on all three roles after the fix -
+each has exactly its three managed policies, zero leftover inline ones.
+This whole incident is saved as a standing project memory (aggregate vs.
+per-document inline-policy quota) since it's exactly the kind of
+non-obvious AWS behavior likely to bite again on any role expected to grow
+over time.
+
+**Full live verification, once the fixes landed** (not just "CI went
+green" - the same "verify against real AWS, not just Terraform" discipline
+this project has followed since Phase 02):
+- `terraform state list` (dev): all 49 expected resources present.
+- `terraform plan` against dev with the real applied `container_image_uri`:
+  zero real drift (one benign `archive_file` zip-hash quirk on the two
+  Lambda stubs - a known timestamp-in-zip artifact, not a config problem).
+- Real AWS status checks via `boto3`: Agent Runtime `READY`, Gateway
+  `READY`.
+- Live `invoke_agent_runtime` call (INC2 query): `graph_status=completed`,
+  built from the exact latest-pushed commit (confirmed by reading the
+  applied `container_uri` back out of state and matching it to the git
+  SHA).
+- **A real finding along the way**: that first live invocation returned a
+  confident, specific "Manager Strategy Commentary" section - but the
+  Knowledge Base's `Retrieve` API (checked directly) returned **zero
+  results**, since dev's S3 docs bucket was still empty from the teardown.
+  The `qual_narrative_pull` agent's own system prompt explicitly says
+  *"never invent strategic positions... if no relevant commentary is
+  found, state that plainly"* - it fabricated anyway, and the compliance
+  judge approved the fabrication rather than catching it or escalating.
+  **This is a real, reproduced compliance-integrity gap, distinct from the
+  infra work, and is not yet fixed** - flagged as the next thing to
+  investigate (see below), not chased further this session given the
+  immediate goal was confirming the deployment itself.
+- Re-uploaded the same 4 mock-fund commentary `.txt` files to the S3 docs
+  bucket (`chroma_store.py`'s `_MOCK_COMMENTARY`, same texts as every prior
+  session) - confirmed the `kb-ingestion-sync` auto-sync pipeline fires for
+  real on a plain `aws s3 cp` (polled `list-ingestion-jobs` until a fresh
+  job appeared, debounced by the pipeline's 5-minute batching window as
+  designed - `4 scanned, 4 indexed, 0 failed`). Direct `Retrieve` call
+  confirmed real grounded content this time, textually matching the
+  uploaded doc. A repeat `invoke_agent_runtime` call this same round
+  actually **escalated** (`compliance_attempts=3, escalated=true`) rather
+  than reaching `APPROVED` - a well-formed graceful outcome per the
+  system's resilience contract, not a crash, but also not the clean
+  `APPROVED` result the same query has reliably gotten in prior sessions
+  on Bedrock/Nova. Not yet investigated further - flagged as a second open
+  question alongside the fabrication finding, both likely worth a session
+  looking at `agents/compliance_agent.py` and the `qual_agent.py` prompt
+  together, since they may be related (a judge that can't reliably catch
+  fabrication may also be inconsistent about what it approves).
+- **Streamlit UI, live-browser-verified against the real deployed Runtime**
+  (Playwright driving headless Chromium, installed standalone into the
+  scratchpad - no `chromium-cli` in this environment, same precedent as
+  the original Phase 02 UI verification): switched Target to "Deployed
+  AgentCore Runtime (AWS)", entered the real runtime ARN, got a genuine
+  **"✅ Runtime READY"** badge (a live `get_agent_runtime` call, not
+  cached), submitted the INC2 example query through the actual form, and
+  got a real rendered result - **✅ Approved, Compliance attempts: 2,
+  15.2s, Graph status: completed** - with the manager commentary now
+  matching the freshly-ingested document verbatim. Zero console errors.
+  This is the first time this specific UI flow was verified against a
+  *freshly redeployed* Runtime (a new ARN each redeploy), not just the one
+  from the original Phase 02 session.
+
+**Dev torn down again, deliberately, 2026-07-14 (end of session)**: user
+requested a full teardown back to zero cost/footprint once verification
+was complete. Scope confirmed explicitly: `environments/dev` only (49
+resources) - `github-oidc` and `bootstrap` left untouched, staging/prod
+already had nothing. `force_delete`/`force_destroy` flags already baked
+into `modules/ecr`/`modules/s3-kb-docs`/`modules/s3-vectors` from the
+Phase 02 teardown incident meant a `terraform plan -destroy` dry-run came
+back clean (`0 to add, 0 to change, 49 to destroy`, no errors) before the
+real `terraform destroy` - unlike Phase 02's teardown, this one went
+clean on the first try, no manual AWS-API workarounds needed. Verified
+directly against AWS afterward, not just `terraform state list`:
+`aws ecr describe-repositories` → `RepositoryNotFoundException`,
+`aws s3api head-bucket` → `404 Not Found`.
+
+### Immediate next step (resume here)
+
+1. **Dev is fully torn down again** (deliberately, this time - see above).
+   A fresh 3-pass redeploy is required before any further dev-environment
+   work - either the familiar local sequence, or a single `deploy.yml`
+   dispatch for `environment=dev` (now proven to work cold-start,
+   including the `ensure-ecr` fix, all 7 rounds of IAM fixes, and the
+   managed-policy restructure - a from-scratch redeploy should go clean on
+   the first dispatch now, not take 8 rounds like this session did).
+2. **Two open, real findings from this session, not yet investigated**:
+   - The qual agent fabricates fund commentary when the Knowledge Base
+     legitimately has zero results, instead of honestly reporting "not
+     found" per its own system prompt - and the compliance judge approved
+     it. Look at `agents/qual_agent.py`'s prompt adherence and
+     `agents/compliance_agent.py`'s judging criteria together.
+   - A real, grounded INC2 query (KB populated, real retrieval confirmed)
+     escalated after 3 compliance attempts instead of reaching `APPROVED`,
+     where the same query has reliably passed in 1-2 attempts in every
+     prior session on Bedrock/Nova. Possibly related to the fabrication
+     finding (a judge inconsistent about what counts as compliant), worth
+     investigating together rather than as two unrelated flukes.
+3. Staging/prod first-ever rollout (`docs/ci_cd_runbook.md` section 4) -
+   still not started. Their tfvars already have the EOL-Claude-model fix
+   from earlier this phase; they'll need the same `deploy-<env>` role ARN
+   wired into `additional_data_access_principals` (placeholder comments
+   already mark where) once their own pass 2 lands, mirroring dev's
+   pattern.
+4. The deliberately-deferred Gateway-routed tools / AgentCore Memory graph
+   integration (unchanged from earlier in this phase).
+
+## Phase 04 — Compliance bug fixes, dev redeploy, judge-determinism investigation
+
+Started 2026-08-05, new session. Worked a prioritized backlog (full detail:
+`C:\Users\komba\.claude\plans\what-are-all-the-sparkling-lampson.md`) built
+from two research agents re-verifying every claim in this doc's Phase 03 log
+against the actual repo (zero discrepancies found) plus a design agent that
+sequenced the remaining work into WS1-WS9.
+
+**WS1-3 (qual-agent fabrication fix + rubric rule + tests) - done, committed
+`0363b65`.** Root cause confirmed by reading the actual files:
+`tools/qual_tools.py::search_fund_commentary` already returns an unambiguous
+"No relevant..." sentinel on empty retrieval, and `agents/qual_agent.py`'s
+prompt already says never to invent commentary - but enforcement was
+LLM-instruction-only, so the agent fabricated anyway, and
+`config/compliance_rubric.py` had zero fabrication/grounding rubric
+dimension for the judge to catch it with. Fixed both layers:
+`QualGroundingHookProvider` (`observability/hooks.py`) forces the qual
+node's final message to a fixed honest response when every
+`search_fund_commentary` call this turn returned only the sentinel
+(code-level, not prompt-level); added a 6th GROUNDING rule to
+`COMPLIANCE_RUBRIC` as a second line of defense, mirrored into
+`docs/compliance_rubric.md`. New unit tests (hook logic, no LLM) and a new
+integration test (`isolated_graph_settings_empty_kb` fixture) - both green,
+including a live run against real Ollama. Full unit suite: 70/70.
+
+**Real, unplanned incident found mid-WS5: the Terraform state S3 bucket
+(`amc-orchestrator-tfstate-766354255780`, from `bootstrap/`) had been
+deleted from AWS entirely** - not just dev's resources, confirmed via
+`head-bucket` (404) and absence from `list-buckets`. Cause unknown (no
+CloudTrail dig done - out of scope, user chose to just fix forward).
+Crucially, `github-oidc/`'s real resources (OIDC provider + all 4
+plan/deploy IAM roles) were still live and functioning despite their
+Terraform state being gone with the bucket. Fixed in two parts, both
+user-confirmed before executing:
+1. `bootstrap/` still had its **local** `terraform.tfstate` intact (it
+   can't use the S3 backend for itself - chicken-and-egg) - a plain
+   `terraform apply` there recreated the identical 6-resource bucket
+   (deterministic name from account ID), 0 errors.
+2. `github-oidc/`'s 24 live resources were reconciled via a temporary
+   `_import.tf` (Terraform `import` blocks, not 24 manual `terraform
+   import` CLI calls) - `terraform plan` confirmed exactly "24 to import, 0
+   to add, 0 to destroy" before applying. The 14 "to change" alongside the
+   import were confirmed benign (AWS re-serializes IAM policy/trust JSON in
+   different byte order than our `jsonencode()` output, so Terraform
+   reports a diff even though the permissions are byte-identical to what's
+   committed - verified by reading the diff content, not assumed). Applied
+   clean, `terraform plan` afterward showed zero drift, temporary import
+   file deleted.
+
+**WS5 (redeploy dev) - done, live-verified.** Docker Desktop wasn't
+running, started it manually. Pass 1 (`-target=module.ecr`), built/pushed a
+`linux/arm64` image tagged with the git SHA (`0363b65`, carrying the WS1-3
+fixes) to the freshly-created ECR repo, full apply - **47 resources
+created clean on the first try, zero IAM gaps** (last session's 7 rounds of
+real-apply-driven fixes are now baked into the committed policies -
+confirms that hardening actually paid off). `opensearch_collection_arn`/
+`endpoint` both empty as expected (dev's `s3_vectors` backend, full
+collection-level gating confirmed still working). Re-uploaded the 4
+mock-fund commentary docs, manually triggered ingestion (4 scanned, 4
+indexed, 0 failed) rather than waiting the 5-minute auto-sync batching
+window. Live `invoke_agent_runtime` (INC2 query):
+`succeeded=true, escalated=false, compliance_attempts=1, graph_status=completed`,
+real DynamoDB metrics + real KB-grounded commentary matching the seeded doc
+verbatim. `terraform plan` zero drift on both `github-oidc` and `dev`
+afterward.
+
+**WS4 (investigate the INC2 3-attempt escalation anomaly) - root-caused,
+but the obvious fix did NOT resolve it - important negative result.**
+Reproduced live: 5 identical INC2 invocations against the freshly-fixed dev
+Runtime gave `compliance_attempts` of 1, 2, 1, 3(escalated), 3 - confirming
+the anomaly is real and NOT explained by the already-fixed fabrication/
+grounding gap (WS1/WS2 were already deployed in this exact tested image)
+and NOT the parked Ollama `tool_choice` no-op (this is Bedrock/Nova, every
+run returned a well-formed verdict, no crash). Hypothesis: non-zero
+`model_temperature_judge` (0.15) causing inconsistent verdicts on
+near-identical drafts. User approved lowering it to 0.0 (committed
+`4fd9cb3`, rebuilt/pushed/redeployed the image, same live-verification
+discipline as WS5). **Re-ran the same 5-invocation test at temperature 0.0
+- still got 1 escalation out of 5, the same rate as before.** Corrected
+conclusion: judge determinism alone doesn't fix it, because
+`model_temperature_worker` (0.2, `quant_data_pull`/`qual_narrative_pull`)
+still makes the draft TEXT the judge evaluates vary run to run - a fully
+deterministic judge can still legitimately reject a genuinely different
+draft. True root cause (worker-temperature-driven draft variance, and/or
+inherent Bedrock non-determinism even at temp 0, and/or genuine occasional
+borderline rubric calls) is **not fully closed**. User decision: keep
+`model_temperature_judge=0.0` anyway (correct, no-downside change) but stop
+chasing this further - an occasional graceful escalation is the system's
+designed resilience contract (never fabricate, escalate gracefully when
+compliance can't be confirmed within budget) working as intended under
+inherent LLM variance, not a defect. Comments in `settings.py`/
+`user_guide.md`/`.env.dev.example` written to reflect this honestly (an
+earlier draft of these comments overclaimed the fix as resolving the
+issue - corrected before committing).
+
+### Immediate next step (resume here)
+
+1. WS6 (staging first-ever rollout) and WS7 (prod first-ever rollout,
+   after staging) - not yet started this session. `docs/ci_cd_runbook.md`
+   section 4 has the full 9-step sequence for each.
+2. WS8 (Gateway-routed tools) and WS9 (AgentCore Memory wiring) - not yet
+   started, independent of WS6/WS7.
+3. If the escalation anomaly resurfaces as a real operational annoyance
+   (not just a live-testing curiosity) rather than staying at its observed
+   ~1-in-5 rate, the next real lever is `model_temperature_worker` - but
+   that trades off natural prose variation in the actual report text, a
+   real quality tradeoff the WS4 session deliberately did not make
+   unilaterally. Capturing the actual rejected verdict/violations text on
+   a live escalation (via CloudWatch) would help confirm whether it's
+   genuine borderline rubric calls vs. pure inference noise - attempted
+   this session but the Terraform-provisioned agent-runtime CloudWatch log
+   group (`/amc-orchestrator/amc-orchestrator-dev/agent-runtime`) had zero
+   log streams despite multiple real invocations, a separate minor
+   observability gap worth fixing first (structlog output isn't reaching
+   CloudWatch for this runtime at all - not investigated further, flagged
+   only).
