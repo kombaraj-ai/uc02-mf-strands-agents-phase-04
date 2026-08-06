@@ -76,7 +76,6 @@ module "lambda_tools" {
   lambda_execution_role_arn = module.iam.lambda_execution_role_arn
   dynamodb_table_name       = module.dynamodb.table_name
   bedrock_knowledge_base_id = var.enable_knowledge_base ? module.knowledge_base[0].knowledge_base_id : ""
-  aws_region                = var.aws_region
   log_retention_days        = var.log_retention_days
   tags                      = local.common_tags
 
@@ -260,13 +259,20 @@ resource "aws_iam_role_policy" "runtime_invoke_gateway" {
 # bedrock-agent-runtime's Retrieve API (mirrors
 # data/knowledge_base_store.py::search_commentary). Gated on
 # enable_knowledge_base since module.knowledge_base is itself count-gated.
+#
+# The IAM action is "bedrock:Retrieve", NOT "bedrock-agent-runtime:Retrieve"
+# (the boto3 client name doesn't match the IAM action namespace here) -
+# confirmed via a real AccessDeniedException from a live Lambda invocation,
+# not assumed; the first guess was wrong and only caught by testing against
+# real AWS, consistent with this project's repeated experience that first-pass
+# IAM action names are frequently wrong.
 data "aws_iam_policy_document" "lambda_kb_retrieve" {
   count = var.enable_knowledge_base ? 1 : 0
 
   statement {
     sid       = "BedrockKnowledgeBaseRetrieve"
     effect    = "Allow"
-    actions   = ["bedrock-agent-runtime:Retrieve"]
+    actions   = ["bedrock:Retrieve"]
     resources = [module.knowledge_base[0].knowledge_base_arn]
   }
 }

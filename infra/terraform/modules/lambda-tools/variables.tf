@@ -22,11 +22,6 @@ variable "bedrock_knowledge_base_id" {
   type        = string
 }
 
-variable "aws_region" {
-  description = "Region for the qual-tools Lambda's bedrock-agent-runtime client."
-  type        = string
-}
-
 variable "memory_size" {
   type    = number
   default = 256

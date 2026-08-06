@@ -76,7 +76,6 @@ module "lambda_tools" {
   lambda_execution_role_arn = module.iam.lambda_execution_role_arn
   dynamodb_table_name       = module.dynamodb.table_name
   bedrock_knowledge_base_id = var.enable_knowledge_base ? module.knowledge_base[0].knowledge_base_id : ""
-  aws_region                = var.aws_region
   log_retention_days        = var.log_retention_days
   tags                      = local.common_tags
 
@@ -252,7 +251,7 @@ data "aws_iam_policy_document" "lambda_kb_retrieve" {
   statement {
     sid       = "BedrockKnowledgeBaseRetrieve"
     effect    = "Allow"
-    actions   = ["bedrock-agent-runtime:Retrieve"]
+    actions   = ["bedrock:Retrieve"]
     resources = [module.knowledge_base[0].knowledge_base_arn]
   }
 }

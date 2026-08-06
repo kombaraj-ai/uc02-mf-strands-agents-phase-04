@@ -23,13 +23,19 @@ locals {
   # convention - var.tool_names' docstring already says these two specific
   # names must match modules/iam's naming convention exactly, it was never
   # actually generic.
+  # AWS_REGION is deliberately NOT set here - it's a Lambda-reserved
+  # environment variable key (the platform injects it automatically, set to
+  # the function's own deployed region) and CreateFunction rejects any
+  # attempt to set it manually (InvalidParameterValueException, confirmed
+  # via a real apply). handler.py's os.environ["AWS_REGION"] still works -
+  # it just reads Lambda's own automatic value instead of a Terraform-set one,
+  # which is correct for this project's single-region deployment anyway.
   tool_env_vars = {
     "quant-tools" = {
       DYNAMODB_TABLE_NAME = var.dynamodb_table_name
     }
     "qual-tools" = {
       BEDROCK_KNOWLEDGE_BASE_ID = var.bedrock_knowledge_base_id
-      AWS_REGION                = var.aws_region
     }
   }
 }

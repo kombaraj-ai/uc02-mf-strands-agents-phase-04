@@ -39,6 +39,7 @@ from typing import Any
 
 from strands.multiagent import GraphBuilder
 from strands.multiagent.graph import Graph
+from strands.tools.mcp.mcp_agent_tool import MCPAgentTool
 
 from amc_orchestrator.agents.compliance_agent import NODE_NAME as COMPLIANCE_NODE
 from amc_orchestrator.agents.compliance_agent import get_compliance_agent
@@ -82,9 +83,27 @@ def build_rfp_graph(settings: Settings):
 
 def _tools_named(mcp_tools: list[Any], name: str) -> list[Any]:
     """Filter the single shared Gateway's advertised tools down to just the
-    one named tool - each agent must only ever see the tool its own system
-    prompt references, matching in-process behavior exactly."""
-    return [t for t in mcp_tools if t.tool_name == name]
+    one named tool, and strip AWS AgentCore Gateway's own
+    "<target-name>___<tool-name>" prefix so the agent-facing tool name
+    matches exactly what system prompts and QualGroundingHookProvider
+    expect.
+
+    The Gateway auto-prefixes every advertised tool with its target's name
+    (confirmed live: listing tools against the real deployed Gateway
+    returned "amc-orchestrator-dev-quant-tools___get_fund_performance", not
+    bare "get_fund_performance") - this isn't documented anywhere found
+    during design and wasn't caught by any unit test, only by a live call.
+    Matching on suffix (rather than exact name) handles that prefix, and
+    reconstructing each matched tool with name_override= strips it so the
+    agent sees the clean, expected name - without this, both agents get an
+    empty tool list (silently, no error) and the LLM fabricates an answer
+    instead of calling anything.
+    """
+    matched = [t for t in mcp_tools if t.tool_name == name or t.tool_name.endswith(f"___{name}")]
+    return [
+        t if t.tool_name == name else MCPAgentTool(t.mcp_tool, t.mcp_client, name_override=name)
+        for t in matched
+    ]
 
 
 def _build_graph(

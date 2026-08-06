@@ -12,8 +12,10 @@ unit tests that build real agents.
 from __future__ import annotations
 
 from contextlib import nullcontext
-from types import SimpleNamespace
 from unittest.mock import patch
+
+from mcp.types import Tool as MCPTool
+from strands.tools.mcp.mcp_agent_tool import MCPAgentTool
 
 from amc_orchestrator.agents.qual_agent import get_qual_agent
 from amc_orchestrator.agents.quant_agent import get_quant_agent
@@ -23,16 +25,39 @@ from amc_orchestrator.tools.quant_tools import get_fund_performance
 from amc_orchestrator.workflows.graph_build import _tools_named, build_rfp_graph
 
 
-def _fake_mcp_tool(name: str) -> SimpleNamespace:
-    return SimpleNamespace(tool_name=name)
+def _fake_gateway_tool(mcp_name: str) -> MCPAgentTool:
+    """A real MCPAgentTool wrapping the exact MCP tool name a real Gateway
+    call returned (confirmed live, 2026-08-06): AWS AgentCore Gateway
+    auto-prefixes every advertised tool with its target's name
+    ("<target-name>___<tool-name>"), so this is deliberately NOT the bare
+    tool name - a fake using the bare name would silently hide the real bug
+    this exact prefixing caused (see _tools_named's docstring)."""
+    mcp_tool = MCPTool(name=mcp_name, inputSchema={"type": "object", "properties": {}})
+    return MCPAgentTool(mcp_tool, mcp_client=object())
 
 
-def test_tools_named_filters_by_exact_tool_name() -> None:
-    tools = [_fake_mcp_tool("get_fund_performance"), _fake_mcp_tool("search_fund_commentary")]
+def test_tools_named_strips_the_gateway_target_prefix() -> None:
+    tools = [
+        _fake_gateway_tool("amc-orchestrator-dev-quant-tools___get_fund_performance"),
+        _fake_gateway_tool("amc-orchestrator-dev-qual-tools___search_fund_commentary"),
+    ]
 
-    assert _tools_named(tools, "get_fund_performance") == [tools[0]]
-    assert _tools_named(tools, "search_fund_commentary") == [tools[1]]
+    quant_matches = _tools_named(tools, "get_fund_performance")
+    qual_matches = _tools_named(tools, "search_fund_commentary")
+
+    assert [t.tool_name for t in quant_matches] == ["get_fund_performance"]
+    assert [t.tool_name for t in qual_matches] == ["search_fund_commentary"]
     assert _tools_named(tools, "unrelated_tool") == []
+
+
+def test_tools_named_also_matches_an_unprefixed_exact_name() -> None:
+    # Defensive: if a future Gateway config ever advertises the bare name
+    # directly (no target prefix), it should still match without renaming.
+    tools = [_fake_gateway_tool("get_fund_performance")]
+
+    matches = _tools_named(tools, "get_fund_performance")
+
+    assert matches == [tools[0]]
 
 
 def test_get_quant_agent_defaults_to_in_process_tool() -> None:
@@ -77,9 +102,9 @@ def test_build_rfp_graph_opens_gateway_client_and_filters_tools_for_gateway_back
     assert settings.effective_tool_backend == "gateway"
 
     fake_tools = [
-        _fake_mcp_tool("get_fund_performance"),
-        _fake_mcp_tool("search_fund_commentary"),
-        _fake_mcp_tool("some_unrelated_tool"),
+        _fake_gateway_tool("amc-orchestrator-dev-quant-tools___get_fund_performance"),
+        _fake_gateway_tool("amc-orchestrator-dev-qual-tools___search_fund_commentary"),
+        _fake_gateway_tool("amc-orchestrator-dev-some-other-tools___some_unrelated_tool"),
     ]
 
     with (
@@ -95,6 +120,9 @@ def test_build_rfp_graph_opens_gateway_client_and_filters_tools_for_gateway_back
             assert graph == "the-graph"
 
     mock_gateway_tools.assert_called_once_with(settings)
-    mock_build.assert_called_once_with(
-        settings, quant_tools=[fake_tools[0]], qual_tools=[fake_tools[1]]
-    )
+    assert mock_build.call_count == 1
+    call_kwargs = mock_build.call_args.kwargs
+    assert call_kwargs["quant_tools"] is not None
+    assert [t.tool_name for t in call_kwargs["quant_tools"]] == ["get_fund_performance"]
+    assert call_kwargs["qual_tools"] is not None
+    assert [t.tool_name for t in call_kwargs["qual_tools"]] == ["search_fund_commentary"]
