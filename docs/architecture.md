@@ -315,7 +315,7 @@ the app for ECR.
 | Qual vector store | OpenSearch Serverless collection (`VECTORSEARCH`) + its security/access policies (staging/prod always; dev's default) — or, dev-only, an S3 Vectors bucket + index (`vector_store_backend = "s3_vectors"`, see below) | `opensearch-serverless`, `opensearch-access-policy`, `opensearch-index` — or `s3-vectors` |
 | Qual RAG | Bedrock Knowledge Base + S3 data source, backed by whichever vector store above is selected | `knowledge-base`, `s3-kb-docs` |
 | Ingestion automation | S3 event → SQS (batches ~5 min) → Lambda → `bedrock-agent:StartIngestionJob`, DLQ + alarm on genuine failure — see below | `kb-ingestion-sync` |
-| Tool compute | Stub Lambda functions behind the Gateway targets (placeholder logic — see below) | `lambda-tools` |
+| Tool compute | Lambda functions behind the Gateway targets — stub logic when this phase was built, real DynamoDB/Knowledge-Base handler logic since Phase 04 (see below) | `lambda-tools` |
 | Container registry | ECR repo for the runtime's image (Terraform never builds/pushes into it) | `ecr` |
 | Access control | One IAM role per AWS-service consumer (runtime, gateway, lambda, knowledge base) | `iam` |
 | Observability | Log groups, a CloudWatch dashboard, Lambda-error/DynamoDB-throttle alarms | `observability` |
@@ -531,13 +531,14 @@ flagged as unverified rather than assumed working; worth doing before trusting t
 
 ### What's still a placeholder
 
-`modules/lambda-tools` creates real, invokable Lambda functions wired into the Gateway, but their
-handler code is still a trivial stub (`return {"status": "not_implemented", ...}`) — real
-Gateway-routed tool logic and wiring AgentCore Memory into the graph (so conversation state
-persists cross-turn) were explicitly deferred, a separate and larger follow-on, not part of the
-work described just above. `aws_bedrockagentcore_agent_runtime` itself is still gated behind
-`enable_agent_runtime` (default `false`) until a real image built from the new `Dockerfile` is
-pushed to the ECR repo `modules/ecr` creates — Terraform deliberately never runs `docker build`.
+`aws_bedrockagentcore_agent_runtime` itself is still gated behind `enable_agent_runtime` (default
+`false`) until a real image built from the new `Dockerfile` is pushed to the ECR repo `modules/ecr`
+creates — Terraform deliberately never runs `docker build`.
+
+At the time this phase was built, `modules/lambda-tools`' handler code was still a trivial stub
+(`return {"status": "not_implemented", ...}`), and nothing read from or wrote to the AgentCore
+Memory resource — both were explicitly deferred as separate, larger follow-ons. **Both are now
+done — see "Phase 04 — Gateway-routed tools & AgentCore Memory" below.**
 
 ### Testing the deployed Runtime: Streamlit's SigV4-backed Runtime mode
 
@@ -759,6 +760,134 @@ credential — a whole new credential surface for a one-time, rarely-changed set
 single-maintainer project that trade-off isn't worth it; [`ci_cd_runbook.md`](ci_cd_runbook.md)
 documents the one-time manual steps instead.
 
+## Phase 04 — Gateway-routed tools & AgentCore Memory
+
+Closes the two placeholders called out at the end of Phase 02: `modules/lambda-tools`'s stub
+handlers, and the never-read/never-written AgentCore Memory resource. Both are **live-verified
+against real AWS, 2026-08-06** — full operational detail (how to turn each on, how to verify a real
+round-trip) lives in [`Execution-05.md`](Execution-05.md)'s Parts C and D; this section covers the
+shape of it and why it's built this way.
+
+### Gateway-routed tools
+
+Until this phase, both agents called `get_fund_performance`/`search_fund_commentary` as plain
+in-process Python functions, even though a real Gateway (MCP over SigV4) had sat provisioned but
+unused since Phase 02. Three pieces made it real:
+
+- **Real Lambda handler logic** (`infra/terraform/modules/lambda-tools/src/handler.py`) — reuses
+  `dynamodb_store.py`/`sqlite_store.py` unmodified for the quant tool, and a small vendored
+  `knowledge_base_lookup.py` (a standalone copy of the `Retrieve`-API call, since Lambda's
+  deployment package can't import the app's own `src/` tree) for the qual tool.
+- **A real per-tool Gateway schema** — `get_fund_performance(ticker)` and
+  `search_fund_commentary(query)` advertised with their real names/argument shapes, replacing one
+  generic placeholder shape both targets used to share.
+- **`tools/gateway_client.py`** — a hand-rolled SigV4-authenticated MCP client
+  (`_SigV4HttpxAuth`, signed via botocore against `bedrock-agentcore` as the service name). Needed
+  because the Gateway's `authorizer_type = "AWS_IAM"` means every request must be SigV4-signed and
+  Strands' `MCPClient` has no built-in AWS-auth transport. `gateway_tools(settings)` is a context
+  manager that **must stay open for the graph's entire execution**, not just while listing tools —
+  `MCPAgentTool.stream()` calls back into the same MCP session on every invocation, confirmed by
+  reading the Strands source directly (this project's standing M0 precedent).
+
+**`Settings.tool_backend`** (`"in_process"` default, `"gateway"` opt-in) selects which path is
+used — **pure opt-in everywhere, including the deployed Runtime**, unlike `model_provider`/
+`data_backend`'s environment-forced pattern, since routing through the Gateway is not a
+correctness requirement, just an additional capability. `effective_tool_backend` exists for the
+same reason `effective_model_provider` does, even though nothing currently overrides it by
+environment — see "Model provider abstraction" above for the general pattern this follows.
+
+**A real, undocumented AWS platform behavior caught only by testing against a live Gateway**:
+AWS AgentCore Gateway auto-prefixes every advertised tool name with its target's name
+(`"<target>___<tool>"`, e.g. `amc-orchestrator-dev-quant-tools___get_fund_performance`). The
+original exact-match filter in `graph_build.py::_tools_named` matched nothing against this, so
+both agents silently got **zero tools** and the LLM fabricated a plausible-looking wrong answer
+instead of erroring — exactly the failure mode this workstream's own CloudWatch-verification
+discipline exists to catch. Fixed by matching on suffix and reconstructing each matched
+`MCPAgentTool` with `name_override=` to strip the prefix before the agent ever sees it. This
+prefixing is permanent AWS behavior, not a one-off bug — any future Gateway target needs the same
+suffix-matching treatment.
+
+**Live proof**: a real CLI run with `TOOL_BACKEND=gateway` returned correct DynamoDB metrics and
+correct Knowledge-Base-grounded commentary, and `aws logs filter-log-events` (not just a
+good-looking answer) confirmed both `quant-tools` and `qual-tools` Lambdas were actually invoked at
+the exact timestamps of that run — ruling out a silent fallback to the in-process path.
+
+### AgentCore Memory wiring
+
+**The core constraint that shapes this whole design**: a Strands `Graph` cannot take a
+`SessionManager` at all, confirmed by reproducing both failures directly —
+`Graph(session_manager=...)` raises `NotImplementedError: MultiAgent is not implemented for this
+repository`, and attaching one to a node `Agent` inside a `GraphBuilder` raises `ValueError:
+Session persistence is not supported for Graph agents yet`. So memory could not be wired the way
+Strands' own `bedrock_agentcore.memory.integrations.strands.session_manager
+.AgentCoreMemorySessionManager` expects; it had to be wired as **orchestration glue around the
+graph invocation instead**, using `bedrock_agentcore.memory.client.MemoryClient` directly (a
+ready-made high-level client, not raw boto3/SigV4 hand-rolling like the Gateway needed — Strands
+just has no built-in usage pattern for it that's compatible with `Graph`).
+
+```
+                       workflows/rfp_invocation.py :: invoke_rfp(settings, question, session_id)
+                      ┌──────────────────────────────────────────────────────────────────────┐
+cli.py            ──▶ │ 1. read_prior_turns(session_id) ─▶ prepended as context onto question │
+api/routes/rfp.py ──▶ │ 2. build_rfp_graph(settings) as graph ; result = graph(question)       │
+runtime_entrypoint──▶ │ 3. summarize_result(result) / summarize_exception(exc)                 │
+                      │ 4. write_turn(session_id, ORIGINAL question, outcome.response_text)     │
+                      └──────────────────────────────────────────────────────────────────────┘
+```
+
+`invoke_rfp` (`workflows/rfp_invocation.py`) is now the single place `cli.py`,
+`api/routes/rfp.py`, and `runtime_entrypoint.py` all funnel through — it consolidates what those
+three previously duplicated identically since Milestone 8 (the `build_rfp_graph` context manager,
+the try/except-around-`graph(...)` safety net, `summarize_result`/`summarize_exception`) and
+layers memory around it:
+
+- **Read**: `read_prior_turns` (`memory/agentcore_memory_client.py`) fetches the session's last 5
+  turns via `MemoryClient.get_last_k_turns` and prepends them as a context block to the question
+  actually sent into the graph — the one point that reaches every downstream node, since `graph()`
+  takes a single string and quant/qual are its entry points. A secondary, best-effort
+  `retrieve_memories` semantic-search layer (over the asynchronously-extracted long-term records
+  the Terraform-provisioned SEMANTIC strategy populates in the background) is layered on top; its
+  absence within a short window is never treated as an error, since extraction lags real time.
+- **Write**: `write_turn` runs after both the success and exception paths, using the *original*
+  question (not the context-prepended one) so stored turns stay a clean, minimal record — re-reading
+  them later shouldn't re-prepend ever-growing prior context into itself.
+- **Never crashes**: both functions catch and log rather than raise — a memory read/write failure
+  must not break the RFP response, the same never-crash contract the graph invocation itself
+  already has (see "Known limitation" above).
+
+**`Settings.memory_backend`** (`"disabled"` default, `"agentcore"` opt-in) follows the same
+pure-opt-in pattern as `tool_backend`. `runtime_entrypoint.py` passes AgentCore Runtime's own
+`context.session_id` straight through — Runtime assigns a stable session id per client session
+automatically, so two `invoke_agent_runtime` calls that reuse it get real continuity with no extra
+client-side plumbing. `cli.py` and `api/routes/rfp.py` expose an equivalent optional `session_id`
+(second CLI argument; request-body field) for local testing.
+
+**One deliberate deviation from the Gateway pattern above**: dev's deployed Runtime sets
+`MEMORY_BACKEND=agentcore` directly in `environments/dev/main.tf`'s `agentcore_runtime`
+`environment_variables` — unlike `TOOL_BACKEND`, which stays opt-in-only even on the deployed
+Runtime. This was done specifically so the deployed Runtime exercises the real IAM grant **as the
+runtime role** on every invocation; testing under an operator's own admin credentials can never
+validate whether an IAM grant is correctly scoped, since admin access would succeed regardless.
+
+**IAM**: one new statement on the Runtime role
+(`bedrock-agentcore:CreateEvent`/`ListEvents`/`RetrieveMemoryRecords`/`GetEvent`, scoped to the
+Memory resource's own ARN) — added directly inside `modules/iam/runtime_role.tf`, unlike the two
+Gateway-routed-tools grants above, since `module.agentcore_memory` (unlike
+`module.agentcore_gateway`/`module.knowledge_base`) never takes a role ARN *from* `modules/iam` as
+an input, so there's no reverse edge and no module-cycle risk to design around.
+
+**Live proof, 2026-08-06**: two `invoke_agent_runtime` calls sharing one session against the real
+deployed dev Runtime. Turn 1 asked "What is INC2's Beta and NAV?" (answered correctly). Turn 2
+asked "how does **that fund's** risk compare to SMC3" — deliberately never naming INC2 — and the
+response correctly resolved "that fund" back to INC2, with matching metrics, alongside a real SMC3
+comparison. Independently confirmed at the data-plane level too: a direct
+`MemoryClient.get_last_k_turns` call against the real Memory resource afterward showed both turns
+actually persisted as `CreateEvent` records under the right session/actor — not just a
+same-session model inference lucky guess. All four IAM action names were correct on the first live
+call, no `AccessDeniedException` — unlike several of this project's earlier AgentCore/S3-Vectors
+action-name guesses (see "The exact `s3vectors:*` IAM action names" above), each of which needed a
+live failure to catch.
+
 ## Repository map
 
 ```
@@ -780,7 +909,10 @@ src/amc_orchestrator/
 │   └── qual_store.py              # facade: dispatches chroma_store vs knowledge_base_store
 ├── tools/
 │   ├── quant_tools.py             # @tool get_fund_performance
-│   └── qual_tools.py              # @tool search_fund_commentary
+│   ├── qual_tools.py              # @tool search_fund_commentary
+│   └── gateway_client.py          # WS8: SigV4-signed MCP client for the real Gateway
+├── memory/
+│   └── agentcore_memory_client.py # WS9: read_prior_turns / write_turn against MemoryClient
 ├── schemas/
 │   └── compliance.py              # ComplianceVerdict
 ├── agents/
@@ -791,7 +923,8 @@ src/amc_orchestrator/
 ├── workflows/
 │   ├── routing.py                 # needs_revision / ready_to_synthesize condition functions
 │   ├── graph_build.py             # build_rfp_graph(settings)
-│   └── result_extraction.py       # RfpOutcome, summarize_result, summarize_exception
+│   ├── result_extraction.py       # RfpOutcome, summarize_result, summarize_exception
+│   └── rfp_invocation.py          # WS9: invoke_rfp() — the shared caller all three entrypoints use
 └── api/
     ├── main.py                    # create_app(), lifespan, CORS, /health, /health/ready
     └── routes/rfp.py              # POST /api/v1/rfp

@@ -32,8 +32,7 @@ from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from amc_orchestrator.config.settings import get_settings
 from amc_orchestrator.data import qual_store, quant_store
 from amc_orchestrator.observability.logging_setup import configure_logging
-from amc_orchestrator.workflows.graph_build import build_rfp_graph
-from amc_orchestrator.workflows.result_extraction import summarize_exception, summarize_result
+from amc_orchestrator.workflows.rfp_invocation import invoke_rfp
 
 logger = structlog.get_logger(__name__)
 
@@ -58,10 +57,12 @@ def invoke(payload: dict[str, Any], context: Any = None) -> dict[str, Any]:
 
     `payload` is expected to carry the client's question under `"prompt"` -
     the key used throughout AWS's own AgentCore Runtime examples/tooling
-    (including the console's test invocation UI). `context.session_id`, if
-    present, is only used for log correlation here - no conversation memory
-    is read/written (AgentCore Memory integration is a separate, larger
-    follow-on, not part of this entrypoint - see CLAUDE.md's Phase 02 notes).
+    (including the console's test invocation UI). `context.session_id`, when
+    AgentCore Runtime supplies one, is the real cross-turn identity used for
+    AgentCore Memory read/write (WS9, `settings.effective_memory_backend ==
+    "agentcore"`) - the Runtime assigns a stable session_id per client
+    session, so two `/invocations` calls sharing one give this entrypoint
+    real multi-turn continuity for free. A no-op when memory is disabled.
     """
     question = payload.get("prompt", "")
     if not question:
@@ -71,17 +72,6 @@ def invoke(payload: dict[str, Any], context: Any = None) -> dict[str, Any]:
     logger.info("runtime_invocation_received", session_id=session_id)
 
     settings = get_settings()
-    try:
-        # build_rfp_graph is a context manager (opens the Gateway MCP client
-        # for the whole invocation when settings.effective_tool_backend ==
-        # "gateway") - construction itself can fail (e.g. an unreachable
-        # Gateway), so it's inside this try alongside graph execution to
-        # keep the same never-crash resilience contract for both.
-        with build_rfp_graph(settings) as graph:
-            result = graph(question)
-        outcome = summarize_result(result)
-    except Exception as exc:  # graph node execution is fail-fast; never crash the caller
-        logger.error("graph_invocation_failed", error=str(exc), error_type=type(exc).__name__)
-        outcome = summarize_exception(exc)
+    outcome = invoke_rfp(settings, question, session_id=session_id)
 
     return dataclasses.asdict(outcome)

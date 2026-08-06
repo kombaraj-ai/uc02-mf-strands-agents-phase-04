@@ -1,7 +1,12 @@
 """Direct graph invocation from a terminal - the pre-API smoke-testing path.
 
 Usage:
-    uv run python -m amc_orchestrator.cli "<client question>"
+    uv run python -m amc_orchestrator.cli "<client question>" [session_id]
+
+The optional `session_id` lets a local run exercise WS9 AgentCore Memory
+continuity (`MEMORY_BACKEND=agentcore`) - pass the same value across two
+invocations to prepend the first turn's context into the second. Omit it for
+the ordinary one-shot smoke-testing path; memory is a no-op without one.
 """
 
 from __future__ import annotations
@@ -14,8 +19,7 @@ import structlog
 from amc_orchestrator.config.settings import get_settings
 from amc_orchestrator.data import qual_store, quant_store
 from amc_orchestrator.observability.logging_setup import bind_trace_context, configure_logging
-from amc_orchestrator.workflows.graph_build import build_rfp_graph
-from amc_orchestrator.workflows.result_extraction import summarize_exception, summarize_result
+from amc_orchestrator.workflows.rfp_invocation import invoke_rfp
 
 logger = structlog.get_logger(__name__)
 
@@ -27,7 +31,7 @@ def bootstrap_dev_data() -> None:
     qual_store.ensure_seeded(settings)
 
 
-def run_rfp_query(question: str) -> None:
+def run_rfp_query(question: str, session_id: str | None = None) -> None:
     settings = get_settings()
     configure_logging(level=settings.log_level, fmt="console" if settings.environment == "dev" else "json")
     bind_trace_context(trace_id=str(uuid.uuid4()))
@@ -35,18 +39,7 @@ def run_rfp_query(question: str) -> None:
     bootstrap_dev_data()
 
     print(f"--- Processing Client Query: '{question}' ---\n")
-    try:
-        # build_rfp_graph is a context manager (opens the Gateway MCP client
-        # for the whole invocation when settings.effective_tool_backend ==
-        # "gateway") - construction itself can fail (e.g. an unreachable
-        # Gateway), so it's inside this try alongside graph execution to
-        # keep the same never-crash resilience contract for both.
-        with build_rfp_graph(settings) as graph:
-            result = graph(question)
-        outcome = summarize_result(result)
-    except Exception as exc:  # graph node execution is fail-fast; never crash the caller
-        logger.error("graph_invocation_failed", error=str(exc), error_type=type(exc).__name__)
-        outcome = summarize_exception(exc)
+    outcome = invoke_rfp(settings, question, session_id=session_id)
 
     print("\n--- FINAL RFP RESPONSE ---")
     print(outcome.response_text)
@@ -58,9 +51,10 @@ def run_rfp_query(question: str) -> None:
 
 def main() -> None:
     if len(sys.argv) < 2:
-        print('Usage: uv run python -m amc_orchestrator.cli "<client question>"')
+        print('Usage: uv run python -m amc_orchestrator.cli "<client question>" [session_id]')
         raise SystemExit(1)
-    run_rfp_query(sys.argv[1])
+    session_id = sys.argv[2] if len(sys.argv) > 2 else None
+    run_rfp_query(sys.argv[1], session_id=session_id)
 
 
 if __name__ == "__main__":

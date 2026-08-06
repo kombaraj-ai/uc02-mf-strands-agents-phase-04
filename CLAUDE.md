@@ -1453,14 +1453,172 @@ inherent LLM variance, not a defect. Comments in `settings.py`/
 earlier draft of these comments overclaimed the fix as resolving the
 issue - corrected before committing).
 
+**WS8 (Gateway-routed tools) - done, implemented AND live-verified against
+real AWS, 2026-08-06 (separate session from the WS1-5/WS4 work above).**
+Full detail lives in this project's auto-memory
+(`phase04-status-2026-08-05` - the memory system introduced after this
+CLAUDE.md section was originally written, not a second doc by choice) since
+that session ran under time pressure and logged there instead of here.
+Summary: real Lambda handler logic behind both Gateway targets (DynamoDB for
+quant, a vendored Bedrock Knowledge Base lookup for qual), a real per-tool
+Gateway schema, a hand-rolled SigV4 MCP client
+(`tools/gateway_client.py`), and a `Settings.tool_backend` opt-in toggle.
+The repo also moved to a fresh single-commit history at a new remote
+(`github.com/kombaraj-ai/uc02-mf-strands-agents-phase-04.git`) around the
+same time - old commit SHAs referenced earlier in this file
+(`0363b65`/`4fd9cb3`/etc.) no longer exist as separate commits, that work is
+folded into the repo's "first commit". Three real bugs found only via live
+AWS testing (AWS Gateway auto-prefixes every tool name with
+`"<target>___<tool>"`, undocumented anywhere; `AWS_REGION` is a
+Lambda-reserved env var key; `bedrock-agent-runtime:Retrieve` doesn't exist,
+real action is `bedrock:Retrieve`) - all fixed, `docs/Execution-05.md`'s
+Part C documents the finished feature. **Dev was left LIVE (not torn down)
+at the end of that session** - current state should be re-confirmed with
+`terraform state list` before assuming either way, since sessions since then
+have torn dev down and redeployed it more than once.
+
+### WS9 (AgentCore Memory wiring) - resumed and completed in this session, 2026-08-06
+
+Picked up mid-implementation after a prior same-day session hit its time
+limit partway through (uncommitted working tree: `memory/agentcore_memory_client.py`,
+`test_memory_client.py`, the WS9 IAM/settings diffs already existed and were
+already solid - verified by reading them, not rewritten). What was missing
+and completed this session: the actual **wiring** of that client into the
+three real callers.
+
+- New `workflows/rfp_invocation.py` (`invoke_rfp(settings, question,
+  session_id=None) -> RfpOutcome`) - consolidates what `cli.py`,
+  `api/routes/rfp.py`, and `runtime_entrypoint.py` each duplicated
+  identically since M8 (the `build_rfp_graph` context manager, the
+  try/except-around-`graph(...)` safety net, `summarize_result`/
+  `summarize_exception`) into one place, and layers memory around it:
+  `read_prior_turns` is prepended to the question actually sent into the
+  graph (the one point that reaches every downstream node, since `graph()`
+  takes a single string), and `write_turn` runs after both the success and
+  exception paths using the *original* question (not the context-prepended
+  one, so stored turns stay a clean, minimal record). All three callers
+  updated to delegate to this instead of duplicating the pattern themselves.
+- `runtime_entrypoint.py` now passes the AgentCore-Runtime-assigned
+  `context.session_id` straight through - this is the real lever for the
+  plan's own verification bar (two `invoke_agent_runtime` calls sharing one
+  session showing real continuity), since AgentCore Runtime assigns that ID
+  per client session automatically, no new plumbing needed on the caller
+  side.
+- `cli.py` gained an optional second positional arg (`session_id`) and
+  `api/routes/rfp.py`'s `RfpRequest` gained an optional `session_id` field -
+  both `None`-safe no-ops when omitted (memory is opt-in, `MEMORY_BACKEND`
+  defaults `disabled`).
+- New `docs/Execution-05.md` "Part D - AgentCore Memory (WS9)" section,
+  mirroring Part C's structure (what shipped, how to turn it on per-caller,
+  how to verify a real round-trip vs. a silent no-op, which tests to run) -
+  also corrected that doc's "What's new" intro, which still claimed dev was
+  torn down (stale relative to WS8's live-redeploy-and-leave-live ending).
+- New `tests/unit/test_rfp_invocation.py` (context-prepending, write-back
+  using the original question, exception path still writes the escalation
+  message, `session_id=None` is a clean no-op) alongside the prior session's
+  already-complete `test_memory_client.py`. `test_api_rfp.py`/
+  `test_runtime_entrypoint.py` patch targets updated to the new
+  `workflows.rfp_invocation.build_rfp_graph` import location.
+- Fixed several `ruff`/import-sort violations introduced along the way
+  (100-char line limit, `tool.ruff.lint` = `["E", "F", "I", "UP", "B"]` per
+  `pyproject.toml`) - confirmed the wider repo already has ~50 *pre-existing*
+  E501 violations in files this session never touched, so those were
+  deliberately left alone as out of scope, not silently ignored.
+
+**Verified this session**: `uv run python -m pytest tests/unit -q` - **111
+passed** (up from the prior WS8-era baseline). `uv run python -m mypy` clean
+on every WS9-touched source file (the `mypy` console-script entry point
+itself failed to resolve the repo's spaced directory name on this machine -
+`python -m mypy` doesn't have that problem, same class of launcher quirk
+already logged for `pytest` in Phase 02). `ruff check` clean on every
+WS9-touched file. `terraform fmt -check -recursive` clean;
+`terraform validate` (via `terraform init -backend=false`, no AWS
+credentials) passes on `github-oidc/` and all three
+`environments/{dev,staging,prod}`.
+
+**Not yet done - the real gap left for next time**: per the original WS9
+plan's own verification bar, live proof needs "a real multi-turn session
+(same `session_id` across two `invoke_agent_runtime` calls) showing the
+second turn's response is influenced by the first turn's content" - this
+has **only been unit-tested with a mocked `MemoryClient`** so far, not
+exercised against a real deployed Memory resource. Also still explicitly
+flagged, not silently assumed: the four `bedrock-agentcore:*` IAM action
+names on the new grant (`CreateEvent`/`ListEvents`/`RetrieveMemoryRecords`/
+`GetEvent`) are best-guesses from API-shape inference, not yet confirmed by
+a live call - this project has been wrong on AgentCore/S3-Vectors action
+names multiple times before (see the Phase 03 log above), each time only
+caught via a real `AccessDeniedException`.
+
+### WS9 live verification - done, 2026-08-06 (same day, follow-on session)
+
+Closed the real gap flagged above. **Finding on resume: the IAM grant itself
+was already live** - `aws iam get-role-policy` on
+`amc-orchestrator-dev-agentcore-runtime-role` showed the exact
+`AgentCoreMemoryAccess` statement already attached, byte-for-byte matching
+the committed Terraform. The interrupted prior session had gotten as far as
+applying the IAM change to real AWS before hitting its time limit, just
+never got to rebuilding the image or running the live test - a real
+`terraform plan` confirmed this (`aws_iam_role_policy.runtime` showed
+`no-op`, only the runtime resource itself needed a change).
+
+**What the currently-deployed image was actually running, discovered before
+touching anything**: `aws_bedrockagentcore_agent_runtime`'s state showed
+`container_uri` tagged `2058fa1` - a docs-only commit that predates *both*
+the WS8 3-bug-fix commit (`30bee40`) *and* all of WS9's code (still
+uncommitted at the time). So a live invoke_agent_runtime test at that point
+would have exercised neither. Rebuilt for real: Docker Desktop wasn't
+running (started manually, same as the WS5 precedent), then
+`docker buildx build --platform linux/arm64 --push` from the current
+(uncommitted) working tree, tagged `30bee40-ws9` to be honest that it isn't
+a clean commit SHA. Added `MEMORY_BACKEND = "agentcore"` to
+`environments/dev/main.tf`'s `agentcore_runtime` environment_variables (a
+deliberate deviation from `TOOL_BACKEND`'s pattern, which stays
+opt-in-only even on the deployed Runtime - done here so the deployed
+Runtime exercises the real IAM grant *as the runtime role* on every call,
+which testing under the operator's own admin credentials can never
+validate regardless of whether the grant is correctly scoped).
+`terraform apply` - clean, only the runtime resource updated (new image +
+new env var), confirmed `READY` on the new image afterward via
+`get_agent_runtime`.
+
+**Live two-turn proof**: one Python script, two `invoke_agent_runtime`
+calls sharing one `runtimeSessionId`. Turn 1: "What is INC2's Beta and
+NAV?" - answered correctly (Beta 0.35, NAV 52.1, `compliance_attempts=3`).
+Turn 2: "How does **that fund's** risk compare to SMC3?" - deliberately
+never named INC2 - and the response correctly resolved "that fund" to
+INC2 with the identical Beta/NAV, plus a real SMC3 comparison
+(`compliance_attempts=2`). This is real evidence on its own (a stateless
+run has no way to know what "that fund" means), but independently
+confirmed at the data-plane level too: a direct
+`MemoryClient.get_last_k_turns` call against the real Memory resource
+afterward showed both turns actually persisted as `CreateEvent` records
+under the right `session_id`/`actor_id`. **No `AccessDeniedException`
+occurred** - all four guessed IAM action names turned out correct on the
+first real call, unlike this project's several prior wrong-guesses on
+AgentCore/S3-Vectors action names (Phase 03 log above) - worth confirming
+explicitly rather than assuming the streak would continue.
+
+`docs/Execution-05.md`'s Part D and `CLAUDE.md`'s "What's new" intro
+updated to reflect the live-verified status; auto-memory updated too.
+**Not yet committed to git** - the WS9 code, the `MEMORY_BACKEND` Terraform
+addition, and these doc updates are all still uncommitted working-tree
+changes as of this writing (the deployed image was built directly from
+that uncommitted tree, not from a commit - see above).
+
 ### Immediate next step (resume here)
 
-1. WS6 (staging first-ever rollout) and WS7 (prod first-ever rollout,
-   after staging) - not yet started this session. `docs/ci_cd_runbook.md`
-   section 4 has the full 9-step sequence for each.
-2. WS8 (Gateway-routed tools) and WS9 (AgentCore Memory wiring) - not yet
-   started, independent of WS6/WS7.
-3. If the escalation anomaly resurfaces as a real operational annoyance
+1. WS6 (staging first-ever rollout) and WS7 (prod first-ever rollout, after
+   staging) - still not started. `docs/ci_cd_runbook.md` section 4 has the
+   full 9-step sequence for each.
+2. Consider committing the WS9 work (not yet done - the user hasn't asked
+   for it explicitly) and rebuilding/repushing the deployed image with a
+   real commit-SHA tag once committed, so `container_uri` stops pointing at
+   a `-ws9`-suffixed tag built from an uncommitted tree.
+3. A `tests/integration/test_memory_round_trip.py` (real
+   `invoke_agent_runtime`, mirroring `test_gateway_routed_graph.py`'s shape)
+   would turn this session's one-off manual verification script into a
+   repeatable automated check - not yet written.
+4. If the escalation anomaly resurfaces as a real operational annoyance
    (not just a live-testing curiosity) rather than staying at its observed
    ~1-in-5 rate, the next real lever is `model_temperature_worker` - but
    that trades off natural prose variation in the actual report text, a
@@ -1468,7 +1626,7 @@ issue - corrected before committing).
    unilaterally. Capturing the actual rejected verdict/violations text on
    a live escalation (via CloudWatch) would help confirm whether it's
    genuine borderline rubric calls vs. pure inference noise - attempted
-   this session but the Terraform-provisioned agent-runtime CloudWatch log
+   once already but the Terraform-provisioned agent-runtime CloudWatch log
    group (`/amc-orchestrator/amc-orchestrator-dev/agent-runtime`) had zero
    log streams despite multiple real invocations, a separate minor
    observability gap worth fixing first (structlog output isn't reaching

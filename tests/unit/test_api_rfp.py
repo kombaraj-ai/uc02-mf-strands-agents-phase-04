@@ -77,7 +77,8 @@ def test_rfp_returns_compliant_completion() -> None:
     # makes the mocked build_rfp_graph(settings) support `with ... as graph:`
     # the same way the real one does, without needing a real Gateway.
     with patch(
-        "amc_orchestrator.api.routes.rfp.build_rfp_graph", return_value=nullcontext(fake_graph)
+        "amc_orchestrator.workflows.rfp_invocation.build_rfp_graph",
+        return_value=nullcontext(fake_graph),
     ):
         client = TestClient(create_app())
         response = client.post(
@@ -96,7 +97,8 @@ def test_rfp_degrades_to_escalation_on_structured_output_failure() -> None:
         raise StructuredOutputException("model failed to invoke the structured output tool")
 
     with patch(
-        "amc_orchestrator.api.routes.rfp.build_rfp_graph", return_value=nullcontext(raising_graph)
+        "amc_orchestrator.workflows.rfp_invocation.build_rfp_graph",
+        return_value=nullcontext(raising_graph),
     ):
         client = TestClient(create_app())
         response = client.post(

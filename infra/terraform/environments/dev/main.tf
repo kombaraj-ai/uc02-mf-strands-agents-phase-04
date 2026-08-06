@@ -56,7 +56,12 @@ module "iam" {
   bedrock_model_arns                = local.bedrock_model_arns
   lambda_tool_names                 = var.lambda_tool_names
   additional_data_access_principals = var.additional_data_access_principals
-  tags                              = local.common_tags
+  # Unlike WS8's two grants below (which needed standalone root-module
+  # resources to avoid a module cycle), agentcore_memory does NOT take a
+  # role ARN from modules/iam as an input, so there's no reverse edge and
+  # this grant lives directly inside modules/iam/runtime_role.tf instead.
+  agentcore_memory_arn = module.agentcore_memory.memory_arn
+  tags                 = local.common_tags
 }
 
 module "opensearch_access_policy" {
@@ -223,8 +228,16 @@ module "agentcore_runtime" {
     BEDROCK_KNOWLEDGE_BASE_ID      = var.enable_knowledge_base ? module.knowledge_base[0].knowledge_base_id : ""
     GATEWAY_URL                    = module.agentcore_gateway.gateway_url
     MEMORY_ID                      = module.agentcore_memory.memory_id
-    BEDROCK_MODEL_ID               = var.bedrock_model_id
-    AWS_REGION                     = var.aws_region
+    # WS9: MEMORY_ID alone is inert (Settings.memory_backend defaults
+    # "disabled", same pure-opt-in pattern as TOOL_BACKEND) - dev opts in
+    # here so the deployed Runtime exercises real AgentCore Memory
+    # read/write on every invocation, needed to live-verify the new IAM
+    # grant actually works as the runtime role (not just under admin
+    # credentials, which would pass regardless of whether the grant is
+    # correctly scoped).
+    MEMORY_BACKEND   = "agentcore"
+    BEDROCK_MODEL_ID = var.bedrock_model_id
+    AWS_REGION       = var.aws_region
   }
 }
 

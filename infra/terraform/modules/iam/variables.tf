@@ -33,6 +33,11 @@ variable "kb_docs_bucket_arn" {
   type        = string
 }
 
+variable "agentcore_memory_arn" {
+  description = "ARN of the AgentCore Memory resource (modules/agentcore-memory's memory_arn output). Unlike agentcore_gateway/knowledge_base, module.agentcore_memory takes no role ARN from modules/iam as an input, so there's no reverse dependency - this can be a required, non-defaulted input without creating a module cycle (WS9)."
+  type        = string
+}
+
 variable "ecr_repository_arn" {
   description = "ARN of the ECR repository the runtime pulls its container image from."
   type        = string

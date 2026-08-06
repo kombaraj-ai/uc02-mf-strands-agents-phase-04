@@ -38,7 +38,8 @@ def test_invoke_returns_compliant_outcome() -> None:
     # build_rfp_graph is a context manager (WS8) - see test_api_rfp.py's
     # identical nullcontext usage for why.
     with patch(
-        "amc_orchestrator.runtime_entrypoint.build_rfp_graph", return_value=nullcontext(fake_graph)
+        "amc_orchestrator.workflows.rfp_invocation.build_rfp_graph",
+        return_value=nullcontext(fake_graph),
     ):
         response = runtime_entrypoint.invoke({"prompt": "What is the risk profile of INC2?"})
 
@@ -52,7 +53,7 @@ def test_invoke_degrades_to_escalation_on_exception() -> None:
         raise RuntimeError("boom")
 
     with patch(
-        "amc_orchestrator.runtime_entrypoint.build_rfp_graph",
+        "amc_orchestrator.workflows.rfp_invocation.build_rfp_graph",
         return_value=nullcontext(raising_graph),
     ):
         response = runtime_entrypoint.invoke({"prompt": "What is the risk profile of INC2?"})

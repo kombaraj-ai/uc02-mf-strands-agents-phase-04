@@ -56,7 +56,12 @@ module "iam" {
   bedrock_model_arns                = local.bedrock_model_arns
   lambda_tool_names                 = var.lambda_tool_names
   additional_data_access_principals = var.additional_data_access_principals
-  tags                              = local.common_tags
+  # Unlike WS8's two grants below (which needed standalone root-module
+  # resources to avoid a module cycle), agentcore_memory does NOT take a
+  # role ARN from modules/iam as an input, so there's no reverse edge and
+  # this grant lives directly inside modules/iam/runtime_role.tf instead.
+  agentcore_memory_arn = module.agentcore_memory.memory_arn
+  tags                 = local.common_tags
 }
 
 module "opensearch_access_policy" {

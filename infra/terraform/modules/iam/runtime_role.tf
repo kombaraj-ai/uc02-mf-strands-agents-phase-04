@@ -76,6 +76,24 @@ data "aws_iam_policy_document" "runtime_permissions" {
     actions   = ["ecr:GetAuthorizationToken"]
     resources = ["*"] # GetAuthorizationToken does not support resource-level scoping.
   }
+
+  # WS9: lets the Runtime read/write real per-turn conversation state via
+  # bedrock_agentcore.memory.client.MemoryClient's create_event/
+  # get_last_k_turns/retrieve_memories. Action names are best-guesses, not
+  # yet confirmed by a live call - this project has been wrong on IAM
+  # action names 3 times already this session, each only caught via a real
+  # AccessDeniedException - verify at apply/first-real-call time.
+  statement {
+    sid    = "AgentCoreMemoryAccess"
+    effect = "Allow"
+    actions = [
+      "bedrock-agentcore:CreateEvent",
+      "bedrock-agentcore:ListEvents",
+      "bedrock-agentcore:RetrieveMemoryRecords",
+      "bedrock-agentcore:GetEvent",
+    ]
+    resources = [var.agentcore_memory_arn]
+  }
 }
 
 resource "aws_iam_role_policy" "runtime" {

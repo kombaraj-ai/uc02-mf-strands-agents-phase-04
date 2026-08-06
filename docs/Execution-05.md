@@ -50,10 +50,23 @@ followed top to bottom by someone who has just cloned the repo and knows nothing
      Gateway is not a correctness requirement, just an additional, already-provisioned capability.
    - See [Part C — Gateway-routed tools](#part-c--gateway-routed-tools-ws8) below for how to turn
      this on and verify it once you have a deployed environment.
-4. **Current AWS state**: as of this writing, `environments/dev` has been **torn down to zero AWS
-   resources** (a deliberate, cost-control teardown from the prior session — see `CLAUDE.md`'s
-   Phase 04 log). None of the WS8 infra changes above have been applied to real AWS yet. Part B
-   below covers the full from-scratch redeploy.
+4. **AgentCore Memory wiring (WS9).** The Memory resource + semantic strategy has existed since
+   Phase 02 but was never actually read from or written to. `workflows/rfp_invocation.py`'s
+   `invoke_rfp` now wraps every graph invocation (CLI, API, deployed Runtime alike) with a
+   best-effort read of the session's prior turns (prepended as context to the next question) and a
+   best-effort write-back of the completed turn — a Strands `Graph` cannot take a `SessionManager`
+   directly, confirmed by reproducing the hard failure, so this is orchestration-layer glue, not a
+   framework feature. New `MEMORY_BACKEND` setting (`disabled` default, `agentcore` opt-in) — same
+   pure-opt-in pattern as `TOOL_BACKEND`, except dev's deployed Runtime itself now defaults it on.
+   See [Part D — AgentCore Memory](#part-d--agentcore-memory-ws9) below. **Live-verified against
+   real AWS, 2026-08-06** — two `invoke_agent_runtime` calls sharing a session, the second turn
+   correctly resolving an unnamed "that fund" reference back to the first turn's INC2, confirmed
+   independently via a direct `MemoryClient.get_last_k_turns` read of the real Memory resource.
+5. **Current AWS state**: `environments/dev` is **live** — WS8 (2026-08-06) and WS9 (same day,
+   later session) both redeployed and live-verified against it in turn, most recently with a
+   rebuilt image (tag `30bee40-ws9`) carrying WS9's memory-wiring code. Confirm with
+   `terraform state list` in `environments/dev` before assuming either way if picking this up
+   later; it may have been torn down since.
 
 ---
 
@@ -437,6 +450,103 @@ keys vs. nested under `input`/`arguments`) was not confirmed by static research 
 the real shape can be read from CloudWatch on the first live call and the parsing tightened if
 needed. If a Gateway-routed query returns an "Unrecognized" or missing-argument error, check the
 Lambda's CloudWatch log for the logged raw event first.
+
+## Part D — AgentCore Memory (WS9)
+
+Also new this phase, and **live-verified against real AWS, 2026-08-06**. The AgentCore Memory
+resource + semantic strategy has existed since Phase 02, but nothing ever read from or wrote to it
+— every query was stateless. This wires real per-session continuity: a second question in the same
+session gets the first question/answer prepended as context. `Settings.memory_backend` is
+**off by default** (the same pure-opt-in pattern as `TOOL_BACKEND` above) — a Graph can't take a
+Strands `SessionManager` at all (confirmed: both `Graph(session_manager=...)` and a node
+`Agent(session_manager=...)` hard-fail against strands-agents 1.47 — see
+`src/amc_orchestrator/memory/agentcore_memory_client.py`'s module docstring), so memory is wired as
+orchestration glue around the graph invocation instead
+(`src/amc_orchestrator/workflows/rfp_invocation.py`'s `invoke_rfp`, the one place `cli.py`,
+`api/routes/rfp.py`, and `runtime_entrypoint.py` now all funnel through). **Unlike `TOOL_BACKEND`,
+`dev`'s deployed Runtime does set `MEMORY_BACKEND=agentcore`** in
+`environments/dev/main.tf`'s `agentcore_runtime` module — a deliberate deviation from the
+Gateway-routed-tools precedent, made so the deployed Runtime exercises the real IAM grant on every
+invocation (verifying it under the actual runtime role, not admin credentials) and so dev keeps
+real multi-turn continuity going forward. staging/prod remain off until their own first rollout.
+
+**Live proof (2026-08-06)**: two `invoke_agent_runtime` calls sharing one `runtimeSessionId`
+against the real deployed dev Runtime. Turn 1 asked "What is INC2's Beta and NAV?" (answered
+correctly: Beta 0.35, NAV 52.1). Turn 2 asked "How does **that fund's** risk compare to SMC3?" —
+deliberately never naming INC2 — and the response correctly resolved "that fund" to INC2, with the
+exact same Beta/NAV, alongside a real SMC3 comparison. A direct `MemoryClient.get_last_k_turns`
+call against the real Memory resource afterward confirmed both turns were actually persisted as
+`CreateEvent` records under the right `session_id`/`actor_id` — not just a lucky same-session
+model inference. No IAM `AccessDenied` errors occurred - the four action names guessed in D1 below
+turned out to be correct on the first real call (this project has been wrong on AgentCore/S3-Vectors
+action names before, so this was worth confirming rather than assuming).
+
+### D1. What got deployed automatically in Part B
+
+- One new IAM grant on the Runtime role: `bedrock-agentcore:CreateEvent`/`ListEvents`/
+  `RetrieveMemoryRecords`/`GetEvent` scoped to the Memory resource's own ARN
+  (`infra/terraform/modules/iam/runtime_role.tf`) — **confirmed correct by a real live call** (see
+  above), unlike several other AgentCore/S3-Vectors IAM action names this project guessed wrong in
+  earlier sessions (see CLAUDE.md's Phase 03 log), each only caught via a real
+  `AccessDeniedException`.
+- `MEMORY_ID = module.agentcore_memory.memory_id` **and** `MEMORY_BACKEND = "agentcore"` in the
+  deployed Runtime's `environment_variables` — dev's Runtime has memory turned on by default (a
+  deliberate deviation from `TOOL_BACKEND`/`GATEWAY_URL` in Part C, which stay opt-in-only even for
+  the deployed Runtime; see the note above D1 for why).
+
+### D2. Turn it on for a local run
+
+Dev's deployed Runtime already has this on (see D1) — nothing to configure there. For a **local**
+CLI/API run against the real Memory resource instead:
+
+```powershell
+$env:MEMORY_BACKEND = "agentcore"
+$env:MEMORY_ID = "<memory_id from `terraform output` in environments/dev>"
+```
+
+Then pass the **same session id** across two questions to see continuity. Each caller surfaces
+`session_id` differently:
+
+- **CLI** — optional second argument:
+  ```powershell
+  uv run python -m amc_orchestrator.cli "What is INC2's Beta?" my-test-session
+  uv run python -m amc_orchestrator.cli "How does that compare to SMC3?" my-test-session
+  ```
+- **API** — optional `session_id` field on the request body:
+  ```powershell
+  Invoke-RestMethod -Method Post -Uri http://localhost:8000/api/v1/rfp -ContentType "application/json" `
+    -Body '{"question": "What is INC2'"'"'s Beta?", "session_id": "my-test-session"}'
+  ```
+- **Deployed Runtime** — no client action needed. AgentCore Runtime assigns a stable
+  `context.session_id` per client session automatically; two `invoke_agent_runtime` calls that
+  reuse the same session get real continuity for free.
+
+For a local process pointed at the real deployed Memory resource, you need real AWS credentials
+active with permission to call the four actions in D1 on that Memory's ARN — the same credentials
+used for `terraform apply` already have this.
+
+### D3. Verify it actually round-tripped (not just "no error")
+
+A clean run alone isn't proof memory did anything — confirm the second turn's *content* is actually
+different because of the first turn, e.g. ask a question in turn 2 that only makes sense with turn
+1's context ("How does **that** fund's risk compare to SMC3?" after turn 1 established INC2). If
+`MEMORY_ID`/credentials are wrong, `read_prior_turns`/`write_turn` fail silently (logged as
+`memory_read_failed`/`memory_write_failed`, never raised — the same never-crash contract as
+everything else in this project) and turn 2 will read exactly as if it had no prior context, so an
+absence of errors is not sufficient evidence.
+
+### D4. Run the Memory-specific tests
+
+```powershell
+# Fast, no AWS needed — MemoryClient itself is mocked, same approach as C4's gateway-client tests
+uv run python -m pytest tests/unit/test_memory_client.py tests/unit/test_rfp_invocation.py -q
+```
+
+No automated integration test exists yet for this workstream (unlike Gateway's
+`test_gateway_routed_graph.py`) — the real multi-turn round-trip in D3 above was confirmed by a
+one-off manual script against the deployed Runtime, not a repeatable pytest case. Adding a
+`tests/integration/test_memory_round_trip.py` (real `invoke_agent_runtime`, same shape as the
+Gateway integration test) is a reasonable follow-up, not yet done.
 
 ---
 

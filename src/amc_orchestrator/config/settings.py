@@ -102,6 +102,18 @@ class Settings(BaseSettings):
     # effective_tool_backend == "gateway".
     gateway_url: str = ""
 
+    # --- Memory wiring (WS9) ---
+    # Whether turns are read from/written to the real AgentCore Memory
+    # resource. Same pure-opt-in-everywhere reasoning as tool_backend above:
+    # cross-turn memory has no correctness requirement the memory-less path
+    # can't already satisfy (every turn already gets a complete, grounded
+    # answer without it), so there's no reason to force a newer, less-proven
+    # code path before it has real production mileage.
+    memory_backend: Literal["disabled", "agentcore"] = "disabled"
+    # Populated from Terraform's `memory_id` output; used when
+    # effective_memory_backend == "agentcore".
+    memory_id: str = ""
+
     # --- Compliance self-correction loop ---
     max_compliance_attempts: int = 3
     # Retries within a single compliance_check node call when qwen2.5:7b-instruct
@@ -169,6 +181,15 @@ class Settings(BaseSettings):
         effective_data_backend above - see tool_backend's own comment for why.
         """
         return self.tool_backend
+
+    @property
+    def effective_memory_backend(self) -> Literal["disabled", "agentcore"]:
+        """Resolve the memory backend actually used.
+
+        Deliberately NOT environment-forced, unlike effective_model_provider/
+        effective_data_backend above - see memory_backend's own comment for why.
+        """
+        return self.memory_backend
 
 
 @lru_cache
