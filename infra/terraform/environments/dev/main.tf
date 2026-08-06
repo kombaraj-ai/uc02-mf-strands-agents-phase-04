@@ -160,12 +160,42 @@ module "agentcore_memory" {
   tags              = local.common_tags
 }
 
+# Cedar-based tool authorization for the Gateway (off by default - see
+# var.enable_policy). A pure leaf resource (see modules/agentcore-policy's
+# own comment for why it takes no gateway_arn input) - the two Cedar
+# aws_bedrockagentcore_policy resources that DO need the gateway's real ARN
+# live as standalone root resources below, right after module.agentcore_gateway,
+# for the same module-cycle reason WS8's runtime_invoke_gateway/
+# lambda_kb_retrieve grants do.
+module "agentcore_policy" {
+  source = "../../modules/agentcore-policy"
+  count  = var.enable_policy ? 1 : 0
+
+  name_prefix = local.name_prefix
+  tags        = local.common_tags
+}
+
 module "agentcore_gateway" {
   source = "../../modules/agentcore-gateway"
 
   name_prefix      = local.name_prefix
   gateway_role_arn = module.iam.gateway_role_arn
   tags             = local.common_tags
+
+  # LOG_ONLY first, always - see infra/terraform/README.md's Policy rollout
+  # section. Flipping to ENFORCE is a deliberate, separate apply once
+  # LOG_ONLY has been live-verified, never the default for a fresh attach.
+  policy_engine_arn  = var.enable_policy ? module.agentcore_policy[0].policy_engine_arn : ""
+  policy_engine_mode = "LOG_ONLY"
+
+  # Forces the gateway role's AuthorizeAction/PartiallyAuthorizeActions/
+  # GetPolicyEngine grant (below) to exist before this resource attaches the
+  # policy engine - both merely reference the same policy-engine ARN with no
+  # direct edge to each other, so without this Terraform could apply them in
+  # either order, and attaching first would 500 with InternalServerException
+  # (confirmed in AWS's own troubleshooting docs - see the Policy module's
+  # design notes).
+  depends_on = [aws_iam_role_policy.gateway_policy_engine_auth]
 
   # Explicit per-tool literals, not a generic loop over function_arns - the
   # two tools have genuinely different real schemas now (WS8), matching the
@@ -198,6 +228,106 @@ module "agentcore_gateway" {
         # shape (QualGroundingHookProvider depends on this exact string).
         { name = "result", type = "string", required = true }
       ]
+    }
+  }
+}
+
+# --- Policy: Cedar authorization for the Gateway - standalone root resources
+# for the same module-cycle reason as WS8's runtime_invoke_gateway/
+# lambda_kb_retrieve grants above module.agentcore_gateway: the gateway role's
+# policy-evaluation grant needs the Gateway's own ARN, and module.iam already
+# feeds gateway_role_arn *into* module.agentcore_gateway, so threading the
+# gateway's ARN back into modules/iam would cycle. Likewise, each Cedar
+# policy's statement text embeds the Gateway's real ARN
+# (`resource == AgentCore::Gateway::"<arn>"`), which module.agentcore_policy
+# deliberately does not take as an input for the same reason - see that
+# module's own main.tf comment.
+data "aws_iam_policy_document" "gateway_policy_engine_auth" {
+  count = var.enable_policy ? 1 : 0
+
+  statement {
+    sid       = "PolicyEngineConfiguration"
+    effect    = "Allow"
+    actions   = ["bedrock-agentcore:GetPolicyEngine"]
+    resources = [module.agentcore_policy[0].policy_engine_arn]
+  }
+
+  statement {
+    sid     = "PolicyEngineAuthorization"
+    effect  = "Allow"
+    actions = ["bedrock-agentcore:AuthorizeAction", "bedrock-agentcore:PartiallyAuthorizeActions"]
+    # Wildcarded to any gateway in this account/region, not
+    # module.agentcore_gateway.gateway_arn - referencing the gateway's own
+    # computed ARN here, combined with this statement's resource being a
+    # depends_on target of module.agentcore_gateway itself, is a real cycle
+    # (confirmed via a real `terraform validate` failure, not assumed).
+    # Low-risk in practice: this is the gateway's own execution role, whose
+    # only reason to exist is running this one gateway - same wildcarding
+    # trade-off already made for kb-ingestion-sync's StartIngestionJob grant.
+    resources = [
+      module.agentcore_policy[0].policy_engine_arn,
+      "arn:aws:bedrock-agentcore:${var.aws_region}:${data.aws_caller_identity.current.account_id}:gateway/*",
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "gateway_policy_engine_auth" {
+  count = var.enable_policy ? 1 : 0
+
+  name   = "${local.name_prefix}-gateway-policy-engine-auth"
+  role   = module.iam.gateway_role_name
+  policy = data.aws_iam_policy_document.gateway_policy_engine_auth[0].json
+}
+
+# One permit policy per real tool: allow-lists it by name (default-deny
+# covers everything else, including any future third tool added to this
+# Gateway before a policy exists for it) and requires its one real input
+# parameter to be non-empty - demonstrates Policy's input-validation
+# capability, not just tool gating. No forbid policies needed for this scope.
+resource "aws_bedrockagentcore_policy" "get_fund_performance" {
+  count = var.enable_policy ? 1 : 0
+
+  name             = "${replace(local.name_prefix, "-", "_")}_get_fund_performance"
+  policy_engine_id = module.agentcore_policy[0].policy_engine_id
+  description      = "Allow get_fund_performance only with a non-empty ticker"
+
+  definition {
+    cedar {
+      statement = <<-EOT
+        permit(
+          principal is AgentCore::IamEntity,
+          action == AgentCore::Action::"${local.name_prefix}-quant-tools___get_fund_performance",
+          resource == AgentCore::Gateway::"${module.agentcore_gateway.gateway_arn}"
+        )
+        when {
+          context.input has ticker &&
+          context.input.ticker != ""
+        };
+      EOT
+    }
+  }
+}
+
+resource "aws_bedrockagentcore_policy" "search_fund_commentary" {
+  count = var.enable_policy ? 1 : 0
+
+  name             = "${replace(local.name_prefix, "-", "_")}_search_fund_commentary"
+  policy_engine_id = module.agentcore_policy[0].policy_engine_id
+  description      = "Allow search_fund_commentary only with a non-empty query"
+
+  definition {
+    cedar {
+      statement = <<-EOT
+        permit(
+          principal is AgentCore::IamEntity,
+          action == AgentCore::Action::"${local.name_prefix}-qual-tools___search_fund_commentary",
+          resource == AgentCore::Gateway::"${module.agentcore_gateway.gateway_arn}"
+        )
+        when {
+          context.input has query &&
+          context.input.query != ""
+        };
+      EOT
     }
   }
 }

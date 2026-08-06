@@ -89,9 +89,10 @@ pipeline logic for "first apply" vs. "steady state".
    both skip (only run for their respective targets); `terraform-apply`
    applies staging's tfvars as committed (`enable_knowledge_base=false`,
    `enable_agent_runtime=false`) - creates IAM roles, ECR repo, DynamoDB,
-   S3 docs bucket, Lambda stubs, Gateway, Memory, observability, and the
-   OpenSearch Serverless collection (staging is `opensearch`-only, unlike
-   dev's `s3_vectors` option).
+   S3 docs bucket, the Lambda tool handlers (real `get_fund_performance`/
+   `search_fund_commentary` logic as of this phase, not placeholder stubs),
+   Gateway, Memory, observability, and the OpenSearch Serverless collection
+   (staging is `opensearch`-only, unlike dev's `s3_vectors` option).
 3. PR: set staging's `additional_data_access_principals` to the
    `deploy-staging` role ARN from step 1 (staging's tfvars already has a
    comment marking exactly where), and `enable_knowledge_base = true`.
@@ -117,6 +118,24 @@ pipeline logic for "first apply" vs. "steady state".
    document upload to prod's S3 docs bucket (pass 2) is still a manual/CI
    step Terraform doesn't do (see `infra/terraform/README.md`'s "Pass 2"),
    same as it was for dev/staging.
+
+### Optional extras once the base rollout is smoke-tested
+
+Three further capabilities exist on top of the base rollout above, all opt-in and none
+required for staging/prod to work - full turn-on/verify steps for each are in
+[`Execution-05.md`](Execution-05.md)'s Parts C, D, and E:
+
+- **Gateway-routed tools** (`TOOL_BACKEND=gateway`) - routes the two real tools through the
+  Gateway created in Pass 1 instead of calling them in-process. Off by default even in the
+  deployed Runtime.
+- **AgentCore Memory** (`MEMORY_BACKEND=agentcore`) - cross-turn conversational continuity.
+  Off by default for staging/prod (unlike dev, which turns it on by default specifically to
+  keep the underlying IAM grant continuously exercised - see Execution-05.md Part D).
+- **AgentCore Policy** (`enable_policy = true` in tfvars) - Cedar-based tool authorization on
+  the Gateway. **Do not enable this for staging or prod yet** - it is currently blocked by a
+  real, reproduced AWS-side issue (every tool call fails once a policy engine is attached,
+  even in the documented-safe log-only mode) that has not been resolved in dev either. See
+  Execution-05.md's Part E for the full account before attempting this anywhere.
 
 ## Why GitHub Environments aren't Terraform-managed
 

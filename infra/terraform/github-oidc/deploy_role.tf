@@ -405,6 +405,78 @@ data "aws_iam_policy_document" "deploy_permissions_agentcore" {
       "arn:aws:bedrock-agentcore:${var.aws_region}:${local.account_id}:workload-identity-directory/default/workload-identity/*",
     ]
   }
+
+  # AgentCore Policy (Cedar authorization attached to the Gateway - see
+  # modules/agentcore-policy). Action/resource-ARN shapes taken from AWS's
+  # own devguide (docs.aws.amazon.com/bedrock-agentcore/latest/devguide/
+  # policy-permissions.html, fetched directly, not a blog) rather than
+  # guessed, but - unlike the AgentCoreRuntimeGatewayMemory/
+  # AgentCoreWorkloadIdentity statements above - NOT yet independently
+  # verified by a real apply through this specific role: every real Policy
+  # apply so far has used direct local `terraform apply` (broader admin
+  # credentials), never this deploy role. Expect to add a missing action
+  # here the first time this role is actually used for a Policy change,
+  # consistent with every prior round documented in this file.
+  statement {
+    sid    = "AgentCorePolicyEngineManagement"
+    effect = "Allow"
+    actions = [
+      "bedrock-agentcore:CreatePolicyEngine", "bedrock-agentcore:UpdatePolicyEngine",
+      "bedrock-agentcore:GetPolicyEngine", "bedrock-agentcore:DeletePolicyEngine",
+      "bedrock-agentcore:ListPolicyEngines",
+      "bedrock-agentcore:TagResource", "bedrock-agentcore:UntagResource", "bedrock-agentcore:ListTagsForResource",
+    ]
+    resources = ["arn:aws:bedrock-agentcore:${var.aws_region}:${local.account_id}:policy-engine/*"]
+  }
+
+  statement {
+    sid    = "AgentCorePolicyManagement"
+    effect = "Allow"
+    actions = [
+      "bedrock-agentcore:CreatePolicy", "bedrock-agentcore:UpdatePolicy",
+      "bedrock-agentcore:GetPolicy", "bedrock-agentcore:DeletePolicy", "bedrock-agentcore:ListPolicies",
+    ]
+    resources = ["arn:aws:bedrock-agentcore:${var.aws_region}:${local.account_id}:policy-engine/*/policy/*"]
+  }
+
+  statement {
+    sid    = "AgentCorePolicyGeneration"
+    effect = "Allow"
+    actions = [
+      "bedrock-agentcore:StartPolicyGeneration", "bedrock-agentcore:GetPolicyGeneration",
+      "bedrock-agentcore:ListPolicyGenerations", "bedrock-agentcore:ListPolicyGenerationAssets",
+    ]
+    resources = ["arn:aws:bedrock-agentcore:${var.aws_region}:${local.account_id}:policy-engine/*/policy-generation/*"]
+  }
+
+  # CreatePolicy/UpdatePolicy validate a Cedar statement's actions against
+  # the target Gateway by calling the Gateway itself, authorized as
+  # InvokeGateway on the Gateway ARN (not a Policy-specific action) - AWS's
+  # own troubleshooting doc calls this out explicitly as a non-obvious gap:
+  # without it, CreatePolicy returns a policyId but the policy then
+  # transitions to CREATE_FAILED with "Insufficient permissions to call
+  # gateway". Not covered by AgentCoreRuntimeGatewayMemory above, which
+  # never needed InvokeGateway before Policy existed.
+  statement {
+    sid       = "AgentCoreInvokeGatewayForPolicyValidation"
+    effect    = "Allow"
+    actions   = ["bedrock-agentcore:InvokeGateway"]
+    resources = ["arn:aws:bedrock-agentcore:${var.aws_region}:${local.account_id}:gateway/*"]
+  }
+
+  # ManageResourceScopedPolicy/ManageAdminPolicy are permission-only gates
+  # (not real API operations) that control what SCOPE of Cedar policy this
+  # role may author - ManageResourceScopedPolicy allows policies targeting a
+  # specific gateway ARN (this project's case, every policy here names one
+  # real gateway); ManageAdminPolicy (wildcard-scoped policies) is
+  # deliberately NOT granted - reserved for platform admins per AWS's own
+  # guidance, not needed by anything this role does.
+  statement {
+    sid       = "AgentCorePolicyScopeManagement"
+    effect    = "Allow"
+    actions   = ["bedrock-agentcore:ManageResourceScopedPolicy"]
+    resources = ["arn:aws:bedrock-agentcore:${var.aws_region}:${local.account_id}:gateway/*"]
+  }
 }
 
 data "aws_iam_policy_document" "deploy_permissions_compute" {

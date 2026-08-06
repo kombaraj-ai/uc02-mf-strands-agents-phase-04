@@ -1,8 +1,9 @@
 # Execution Guide: AMC RFP & Portfolio Insight Orchestrator — Phase 04
 
 This is the step-by-step "how do I actually run this" guide for the current state of the
-repository (Phase 04: compliance grounding fixes + Gateway-routed tools). It is meant to be
-followed top to bottom by someone who has just cloned the repo and knows nothing else about it.
+repository (Phase 04: compliance grounding fixes, Gateway-routed tools, AgentCore Memory, and
+AgentCore Policy). It is meant to be followed top to bottom by someone who has just cloned the repo
+and knows nothing else about it.
 
 - For the local-DEV setup + AWS/CI-CD deployment mechanics that are **unchanged** since the prior
   phase, this guide gives the full commands inline (so you don't have to jump between documents).
@@ -62,11 +63,23 @@ followed top to bottom by someone who has just cloned the repo and knows nothing
    real AWS, 2026-08-06** — two `invoke_agent_runtime` calls sharing a session, the second turn
    correctly resolving an unnamed "that fund" reference back to the first turn's INC2, confirmed
    independently via a direct `MemoryClient.get_last_k_turns` read of the real Memory resource.
-5. **Current AWS state**: `environments/dev` is **live** — WS8 (2026-08-06) and WS9 (same day,
-   later session) both redeployed and live-verified against it in turn, most recently with a
-   rebuilt image (tag `30bee40-ws9`) carrying WS9's memory-wiring code. Confirm with
-   `terraform state list` in `environments/dev` before assuming either way if picking this up
-   later; it may have been torn down since.
+5. **AgentCore Policy (WS10) — built, Terraform-applies cleanly, but currently BLOCKED by a real
+   AWS-side bug.** Cedar-based authorization attached to the Gateway (`modules/agentcore-policy`),
+   allow-listing the two real tools and validating their one input parameter each is non-empty.
+   New `enable_policy` setting (`false` default, same opt-in pattern as `enable_knowledge_base`).
+   **Do not enable this yet** — see [Part E — AgentCore Policy](#part-e--agentcore-policy-ws10)
+   below for the full account of why. The short version: attaching a Policy engine to the Gateway,
+   even in the documented-safe `LOG_ONLY` mode, makes every real tool call fail with a generic
+   `InternalServerException` — reproduced for both IAM-user and assumed-role callers, config
+   confirmed correct every way it can be checked, root-caused as far as possible without an AWS
+   Support case. `environments/dev` currently has Policy detached (`enable_policy=false`) to keep
+   the already-working Gateway-routed-tools path (WS8) functional.
+6. **Current AWS state**: `environments/dev` is **live** — WS8, WS9, and (partially — see above)
+   WS10 have all been exercised against it in turn, most recently with a rebuilt image (tag
+   `30bee40-ws9`) carrying WS9's memory-wiring code; WS10 only ever touched infrastructure
+   (Policy resources), not the container image. Confirm with `terraform state list` in
+   `environments/dev` before assuming either way if picking this up later; it may have been torn
+   down since.
 
 ---
 
@@ -547,6 +560,123 @@ No automated integration test exists yet for this workstream (unlike Gateway's
 one-off manual script against the deployed Runtime, not a repeatable pytest case. Adding a
 `tests/integration/test_memory_round_trip.py` (real `invoke_agent_runtime`, same shape as the
 Gateway integration test) is a reasonable follow-up, not yet done.
+
+---
+
+## Part E — AgentCore Policy (WS10)
+
+New this phase, and **currently blocked** — read E3 before enabling anything here against a real
+environment. Amazon Bedrock AgentCore Policy is a real, GA capability (GA March 2026): a Cedar-based
+authorization layer that attaches to an AgentCore Gateway and evaluates every `tools/list`/
+`tools/call` request before the underlying Lambda ever runs. Verified against primary sources before
+building anything — this project's own installed `botocore` 1.43.45 service model (real API
+operations), AWS's IAM policy-generator dataset (real `bedrock-agentcore:*` action names), the
+installed `hashicorp/aws` v6.54.0 provider schema (`aws_bedrockagentcore_policy_engine`/
+`aws_bedrockagentcore_policy` exist natively, no community-provider workaround needed, unlike the
+OpenSearch-index precedent), and AWS's official devguide for Cedar syntax and IAM permission JSON.
+
+### E1. What got built
+
+- New leaf module `infra/terraform/modules/agentcore-policy` — just the policy engine
+  (`aws_bedrockagentcore_policy_engine`), no role ARN or Gateway ARN taken as input, mirroring
+  `modules/agentcore-memory`'s shape exactly.
+- `modules/agentcore-gateway` gained an optional `policy_engine_configuration` block (only renders
+  when a policy engine ARN is supplied) and a `lifecycle { ignore_changes = [metadata_configuration] }`
+  on each Gateway target — AWS auto-populates that attribute with a reserved
+  `x-amzn-bedrock-agentcore-policy-session-id` header once a policy engine is attached, and the
+  Terraform provider itself rejects declaring any `x-amzn-*` value, so this tells Terraform to stop
+  fighting an attribute it cannot legally own.
+- Two Cedar `permit` policies as standalone root resources in each environment (same
+  module-cycle-avoidance shape as WS8's `runtime_invoke_gateway`/`lambda_kb_retrieve` grants) — one
+  per real tool, each allow-listing it by name **and** requiring its one input parameter to be
+  non-empty:
+  ```cedar
+  permit(
+    principal is AgentCore::IamEntity,
+    action == AgentCore::Action::"<name-prefix>-quant-tools___get_fund_performance",
+    resource == AgentCore::Gateway::"<gateway_arn>"
+  )
+  when {
+    context.input has ticker &&
+    context.input.ticker != ""
+  };
+  ```
+  Default-deny already covers everything not explicitly permitted — a future third tool added to
+  this Gateway is denied until a policy exists for it, not silently exposed. No `forbid` policies
+  needed for this scope.
+- IAM: a `PolicyEngineConfiguration`/`PolicyEngineAuthorization` statement on the Gateway's own
+  execution role (`GetPolicyEngine`, `AuthorizeAction`, `PartiallyAuthorizeActions` — wildcarded to
+  `gateway/*` rather than the Gateway's own computed ARN, since referencing that ARN here while also
+  making the Gateway `depends_on` this same statement is a real Terraform cycle, confirmed by
+  `terraform validate` itself), plus the matching "Resource Management Role" permissions
+  (`CreatePolicyEngine`/`CreatePolicy`/`StartPolicyGeneration`/`InvokeGateway`-for-policy-validation/
+  `ManageResourceScopedPolicy`) on the CI `deploy-<env>` roles in `infra/terraform/github-oidc`.
+- New `GatewayPolicyDenialHookProvider` (`observability/hooks.py`) — mirrors
+  `QualGroundingHookProvider`'s pattern. A Policy denial comes back as a normal MCP tool result with
+  `status="error"` (confirmed by reading Strands' actual `mcp_client.py` source — it never raises),
+  so without this hook the denial's raw exception text would be handed to the LLM as if it were
+  data. Registered on both agents, gateway-backend-only.
+- New `enable_policy` setting (`false` default, same three-pass-style opt-in as
+  `enable_knowledge_base`/`enable_agent_runtime`).
+
+### E2. Turn it on (once E3's blocker is resolved)
+
+```powershell
+cd infra/terraform/environments/dev
+terraform apply -var="enable_policy=true" -var="container_image_uri=<current deployed image>"
+```
+
+This attaches the Policy engine to the Gateway in `LOG_ONLY` mode (hardcoded in
+`modules/agentcore-gateway`'s call site — evaluates and logs every request without blocking, never
+the default for a fresh attach). Flipping to `ENFORCE` is a deliberate second, separate apply, not
+automatic — see `infra/terraform/README.md`'s Policy rollout notes once this is unblocked.
+
+### E3. Known blocker — do not enable against a real environment yet
+
+**Attaching a Policy engine to the Gateway, even in `LOG_ONLY` mode, makes every real tool call fail
+with a generic `InternalServerException`** ("An internal error occurred. Please retry later.") —
+including calls that should be explicitly permitted by the Cedar policies above, and including
+`LOG_ONLY` mode specifically, which AWS's own documentation says should only evaluate and log,
+never block.
+
+Root-caused as far as possible without an AWS Support case, all on real AWS, not simulated:
+
+- **A/B confirmed**: an identical direct MCP call through `tools/gateway_client.py` succeeds
+  immediately (real DynamoDB data back) with the Policy engine detached, and fails identically every
+  time with it attached. Not a fluke or a config typo.
+- **Not an IAM-principal-type issue**: initially suspected the caller needed to be an assumed role
+  rather than an IAM user (AWS's docs only document the assumed-role ARN shape for
+  `AgentCore::IamEntity`) — ruled out by testing the real production path directly: a live
+  `invoke_agent_runtime` call against the deployed Runtime (which always authenticates as an assumed
+  role) hit the exact same generic failure.
+- **No diagnostic signal available**: both the Gateway's and the agent-runtime's CloudWatch log
+  groups have zero log streams (a pre-existing gap, not new — flagged at the end of WS4 already),
+  and X-Ray has zero trace summaries for the test window. AWS's own Policy troubleshooting guidance
+  leans on both of these.
+- Every other angle checked out correct: gateway `READY`, policy engine `ACTIVE`, both Cedar
+  policies `ACTIVE` with the right action names, IAM permissions present and correctly scoped
+  (confirmed by reading the live-attached policy JSON directly, not assumed).
+
+`environments/dev` currently has Policy detached (`enable_policy=false`, confirmed via
+`terraform plan` showing "No changes") specifically so the already-working Gateway-routed-tools path
+from Part C keeps working. The Terraform module, IAM, and `GatewayPolicyDenialHookProvider` code are
+all believed correct and are safe to re-attempt once this is unblocked. Two concrete next steps, in
+order of cost: try `ENFORCE` mode instead of `LOG_ONLY` (a separate code path AWS's docs describe
+independently — if `ENFORCE` works while `LOG_ONLY` doesn't, that is a precise, actionable bug
+report), or open an AWS Support case with the reproduction steps above.
+
+### E4. Run the Policy-specific tests
+
+```powershell
+# Fast, no AWS needed - GatewayPolicyDenialHookProvider is exercised with constructed Strands
+# hook events, no model or real Gateway call, same isolation-first approach as C4/D4
+uv run python -m pytest tests/unit/test_gateway_policy_denial_hook.py -q
+```
+
+No integration test exists for the live round-trip (unlike Gateway's own
+`test_gateway_routed_graph.py`) — given E3's open blocker, one would currently fail for reasons
+unrelated to what it would be testing, so it hasn't been written yet. Worth adding once E3 is
+resolved, mirroring the existing Gateway integration test's shape.
 
 ---
 

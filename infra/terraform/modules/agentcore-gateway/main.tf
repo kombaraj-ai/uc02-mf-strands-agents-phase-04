@@ -8,6 +8,14 @@ resource "aws_bedrockagentcore_gateway" "amc_tools" {
   kms_key_arn     = var.kms_key_arn
   description     = "Exposes AMC quant/qual tools as MCP tools for the agent runtime"
 
+  dynamic "policy_engine_configuration" {
+    for_each = var.policy_engine_arn != "" ? [1] : []
+    content {
+      arn  = var.policy_engine_arn
+      mode = var.policy_engine_mode
+    }
+  }
+
   tags = var.tags
 }
 
@@ -20,6 +28,20 @@ resource "aws_bedrockagentcore_gateway_target" "lambda_tool" {
 
   credential_provider_configuration {
     gateway_iam_role {}
+  }
+
+  # Attaching a policy engine to the Gateway makes AWS auto-populate this
+  # target's metadata_configuration.allowed_request_headers with
+  # "x-amzn-bedrock-agentcore-policy-session-id" (confirmed only by a real
+  # apply - undiscoverable from any docs consulted while designing Policy).
+  # This can't be declared here to "adopt" it: the provider itself rejects
+  # any x-amzn-* value at plan time (reserved prefix, one narrow exception
+  # unrelated to this), confirmed by trying exactly that and getting a real
+  # validation error. So instead of fighting an attribute this project
+  # cannot legally set, tell Terraform to stop diffing it at all - it's
+  # genuinely AWS-managed, not something this config can or should own.
+  lifecycle {
+    ignore_changes = [metadata_configuration]
   }
 
   target_configuration {

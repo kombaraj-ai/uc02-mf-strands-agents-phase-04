@@ -48,6 +48,12 @@ variable "container_image_uri" {
   default     = ""
 }
 
+variable "enable_policy" {
+  description = "Attach a Cedar-based AgentCore Policy engine to the Gateway, authorizing which tools may be called and validating their inputs. Off by default - the Gateway allows any tool call its own IAM role permits, exactly as before Policy existed. Always applies in LOG_ONLY mode (see modules/agentcore-gateway's policy_engine_mode) - switching to ENFORCE is a deliberate follow-up apply, not automatic."
+  type        = bool
+  default     = false
+}
+
 # --- Cost/HA knobs -------------------------------------------------------
 variable "use_cmk" {
   description = "Customer-managed KMS keys instead of AWS-managed encryption across S3/DynamoDB/OpenSearch/Memory. On in staging to mirror prod's security posture ahead of the real cutover."

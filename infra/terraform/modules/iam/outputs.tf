@@ -10,6 +10,10 @@ output "gateway_role_arn" {
   value = aws_iam_role.gateway.arn
 }
 
+output "gateway_role_name" {
+  value = aws_iam_role.gateway.name
+}
+
 output "lambda_execution_role_arn" {
   value = aws_iam_role.lambda_execution.arn
 }

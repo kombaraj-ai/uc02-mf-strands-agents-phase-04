@@ -126,3 +126,58 @@ class QualGroundingHookProvider(HookProvider):
         if searched and not found and event.result is not None:
             event.result.message["content"] = [{"text": self.NO_COMMENTARY_RESPONSE}]
             logger.info("qual_grounding_enforced", node="qual_narrative_pull")
+
+
+class GatewayPolicyDenialHookProvider(HookProvider):
+    """Forces an agent's answer to stay honest when a Gateway-routed tool call
+    is denied by AgentCore Policy, instead of trusting the LLM to react
+    sensibly to a denial it has never been prompted about.
+
+    Only relevant once `TOOL_BACKEND=gateway` *and* a Policy engine is
+    attached to the Gateway in `ENFORCE` mode (see
+    `infra/terraform/modules/agentcore-policy`) - a harmless no-op otherwise,
+    since no tool call is ever actually denied without both. A denial comes
+    back as a normal (non-exception) MCP tool result with `isError: true` -
+    confirmed by reading `strands/tools/mcp/mcp_client.py::_handle_tool_result`
+    directly: Strands maps this to `status="error"` on the resulting
+    `AfterToolCallEvent`, it never raises. Nothing here changes that -
+    without this hook, though, the denial's raw exception text
+    ("AuthorizeActionException - Tool Execution Denied...") would just be
+    handed to the model as an ordinary tool result, risking either a
+    fabricated answer or that raw text leaking into the client-facing
+    report - the same class of gap `QualGroundingHookProvider` above closes
+    for the empty-Knowledge-Base case, enforced at the code layer rather
+    than left to prompt instruction.
+    """
+
+    _DENIAL_SIGNATURES = ("AuthorizeActionException", "Tool Execution Denied")
+
+    def __init__(self, node_name: str, honest_response: str) -> None:
+        self._node_name = node_name
+        self._honest_response = honest_response
+        self._denied: dict[int, bool] = {}
+
+    def register_hooks(self, registry: HookRegistry, **kwargs: Any) -> None:
+        registry.add_callback(BeforeInvocationEvent, self._on_before_invocation)
+        registry.add_callback(AfterToolCallEvent, self._on_after_tool_call)
+        registry.add_callback(AfterInvocationEvent, self._on_after_invocation)
+
+    def _on_before_invocation(self, event: BeforeInvocationEvent) -> None:
+        self._denied[id(event.agent)] = False
+
+    def _on_after_tool_call(self, event: AfterToolCallEvent) -> None:
+        result = event.result
+        if not isinstance(result, dict) or result.get("status") != "error":
+            return
+        text = "".join(
+            block.get("text", "") for block in result.get("content", []) if isinstance(block, dict)
+        )
+        if any(signature in text for signature in self._DENIAL_SIGNATURES):
+            self._denied[id(event.agent)] = True
+
+    def _on_after_invocation(self, event: AfterInvocationEvent) -> None:
+        key = id(event.agent)
+        denied = self._denied.pop(key, False)
+        if denied and event.result is not None:
+            event.result.message["content"] = [{"text": self._honest_response}]
+            logger.info("gateway_policy_denial_enforced", node=self._node_name)

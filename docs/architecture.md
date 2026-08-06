@@ -760,13 +760,16 @@ credential — a whole new credential surface for a one-time, rarely-changed set
 single-maintainer project that trade-off isn't worth it; [`ci_cd_runbook.md`](ci_cd_runbook.md)
 documents the one-time manual steps instead.
 
-## Phase 04 — Gateway-routed tools & AgentCore Memory
+## Phase 04 — Gateway-routed tools, AgentCore Memory & Policy
 
-Closes the two placeholders called out at the end of Phase 02: `modules/lambda-tools`'s stub
-handlers, and the never-read/never-written AgentCore Memory resource. Both are **live-verified
-against real AWS, 2026-08-06** — full operational detail (how to turn each on, how to verify a real
-round-trip) lives in [`Execution-05.md`](Execution-05.md)'s Parts C and D; this section covers the
-shape of it and why it's built this way.
+Closes the two placeholders called out at the end of Phase 02 — `modules/lambda-tools`'s stub
+handlers, and the never-read/never-written AgentCore Memory resource — both **live-verified against
+real AWS, 2026-08-06**, and adds a third capability layered on the same Gateway: **AgentCore
+Policy**, Cedar-based tool authorization. Policy's Terraform, IAM, and application-layer code are
+all built and apply cleanly, but it is **not yet live** — a real AWS-side bug blocks it, documented
+in full below. Full operational detail (how to turn each on, how to verify a real round-trip, the
+exact Policy blocker) lives in [`Execution-05.md`](Execution-05.md)'s Parts C, D, and E; this
+section covers the shape of it and why it's built this way.
 
 ### Gateway-routed tools
 
@@ -888,6 +891,111 @@ call, no `AccessDeniedException` — unlike several of this project's earlier Ag
 action-name guesses (see "The exact `s3vectors:*` IAM action names" above), each of which needed a
 live failure to catch.
 
+### AgentCore Policy
+
+**What it is**: Amazon Bedrock AgentCore Policy is a real, GA capability (GA March 2026) — a
+Cedar-based authorization layer that attaches to an AgentCore Gateway and evaluates every
+`tools/list`/`tools/call` request before the underlying Lambda ever runs. It sits entirely at the
+AWS platform layer, upstream of `tools/quant_tools.py`/`tools/qual_tools.py` and the Lambda handler
+alike — confirmed by reading `infra/terraform/modules/lambda-tools/src/handler.py` directly, which
+has no policy/authorization logic of any kind, and doesn't need any: enforcement happens before the
+Lambda is ever invoked.
+
+**Verified against primary sources before building anything**, matching this project's standing M0
+precedent — not blog posts: the exact API operations (`CreatePolicyEngine`, `CreatePolicy`,
+`UpdateGateway`'s `policyEngineConfiguration`, ...) confirmed to exist by inspecting this project's
+own installed `botocore` 1.43.45 service model directly; the exact `bedrock-agentcore:*` IAM action
+names confirmed against AWS's own IAM policy-generator dataset; and —
+`aws_bedrockagentcore_policy_engine`/`aws_bedrockagentcore_policy` confirmed to already exist as
+**native** resources in this project's installed `hashicorp/aws` v6.54.0 provider (via
+`terraform providers schema -json`), so unlike the OpenSearch-index precedent, no community-provider
+workaround was needed here.
+
+**Default-deny, forbid-wins**: a Cedar policy is a `permit`/`forbid` statement over
+`(principal, action, resource, context)`. If no `permit` matches a request, it's denied; if any
+`forbid` matches, it's denied regardless of any `permit`. This means *attaching* a policy engine to
+the Gateway is itself the governance action — once attached in `ENFORCE` mode, every tool call is
+denied unless a `permit` policy explicitly covers it, not just the ones a `forbid` happens to name.
+Two `permit` policies exist here, one per real tool, each combining a name allow-list with an input
+validation check (`context.input has ticker && context.input.ticker != ""`) — no `forbid` policies
+are needed for this scope, since default-deny already provides the desired defense-in-depth (a
+future third tool added to this Gateway is denied until a policy exists for it, not silently
+exposed).
+
+**Module shape — a leaf resource, deliberately not taking a Gateway ARN as input**:
+`modules/agentcore-policy` creates only the policy engine
+(`aws_bedrockagentcore_policy_engine`), mirroring `modules/agentcore-memory`'s exact shape. The two
+Cedar policies themselves are **not** inside this module — each one's statement text must embed the
+Gateway's real ARN (`resource == AgentCore::Gateway::"<arn>"`), which would make this module and
+`modules/agentcore-gateway` reference each other's outputs (the gateway needs this module's
+`policy_engine_arn` for its `policy_engine_configuration`; the policies need the gateway's `arn` for
+their Cedar text). Rather than rely on Terraform resolving that shape, the two policies are
+standalone root-module resources in each environment instead — the same "avoid a module cycle with
+one-off root resources" precedent WS8 already established for its two Gateway-routed-tools IAM
+grants.
+
+**A real Terraform cycle, caught by `terraform validate` itself, not just designed around in
+theory**: the Gateway execution role needs `AuthorizeAction`/`PartiallyAuthorizeActions`/
+`GetPolicyEngine`, and that IAM grant must land *before* the Gateway's own
+`policy_engine_configuration` is attached (AWS's own troubleshooting docs: attaching without it
+first returns `InternalServerException`, and even after fixing the permissions, every tool call
+silently denies by default until they're in place). The first attempt scoped that IAM statement to
+the Gateway's own computed ARN and used a `depends_on` to force the ordering — `terraform validate`
+rejected it outright as a real cycle (the IAM statement's data source referenced the Gateway's
+output, while the Gateway depended on that same IAM statement). Fixed by wildcarding the
+gateway-resource-type portion of that one statement to `gateway/*` instead of the Gateway's specific
+ARN — the same wildcarding trade-off already made for `kb-ingestion-sync`'s `StartIngestionJob`
+grant, low-risk here since it's the Gateway's own execution role, whose only reason to exist is
+running this one Gateway.
+
+**A second real surprise, this time from AWS's own runtime behavior, not Terraform's graph**:
+attaching a policy engine makes AWS auto-populate each Gateway target's
+`metadata_configuration.allowed_request_headers` with a reserved
+`x-amzn-bedrock-agentcore-policy-session-id` header — confirmed only by a real apply (a `terraform
+plan` immediately afterward showed this as drift to revert). It can't be declared in Terraform to
+"adopt" it either: the provider itself rejects any `x-amzn-*` prefixed value at plan time (a real
+validation error, not assumed). Fixed with `lifecycle { ignore_changes = [metadata_configuration] }`
+on the Gateway target resource — telling Terraform to stop diffing an attribute it cannot legally
+own, rather than fighting AWS's own side effect on every apply.
+
+**Application layer**: a Policy denial comes back to the caller as a normal (non-exception) MCP tool
+result with `isError: true` — confirmed by reading `strands/tools/mcp/mcp_client.py`'s
+`_handle_tool_result` directly, which maps this to `status="error"` on the resulting
+`AfterToolCallEvent`, never raising. Left unhandled, the denial's raw exception text
+("AuthorizeActionException - Tool Execution Denied...") would be handed to the quant/qual LLM as if
+it were ordinary data — the same class of gap `QualGroundingHookProvider` closes for the empty-KB
+case. `GatewayPolicyDenialHookProvider` (`observability/hooks.py`) closes it the same way: detects
+the denial signature in a tool result and forces the node's final message to a fixed, honest
+response instead. Registered on both agents, gateway-backend-only, and a harmless no-op unless a
+policy engine is actually attached in `ENFORCE` mode.
+
+**Not yet live — a real, reproduced AWS-side blocker, not a configuration mistake**: with the Policy
+engine correctly attached to the Gateway in `LOG_ONLY` mode — confirmed `ACTIVE`/`READY` via direct
+API calls, both Cedar policies `ACTIVE` with the correct action names, IAM permissions present and
+correctly scoped (read back directly, not assumed) — **every tool call through the Gateway fails
+with a generic `InternalServerException`**, including calls that should be explicitly permitted, and
+including `LOG_ONLY` mode specifically, which AWS's own documentation says should only evaluate and
+log, never block. Root-caused as far as possible without an AWS Support case:
+
+- **A/B confirmed live**: an identical direct MCP call succeeds immediately (real DynamoDB data
+  back) with the policy engine detached, and fails identically every time with it attached.
+- **Ruled out IAM principal type as the cause**: initially suspected the caller needed to be an
+  assumed role rather than an IAM user (AWS's docs only document the assumed-role ARN shape for
+  `AgentCore::IamEntity`) — ruled out by testing the real production path directly, a live
+  `invoke_agent_runtime` call against the deployed Runtime (which always authenticates as an assumed
+  role), which hit the exact same generic failure.
+- **No diagnostic signal available**: both the Gateway's and the agent-runtime's CloudWatch log
+  groups have zero log streams (a pre-existing gap, not new — already flagged at the end of the
+  WS4 escalation-anomaly investigation), and X-Ray has zero trace summaries for the test window.
+
+`environments/dev` currently has Policy detached (`enable_policy = false`, the default) specifically
+so the already-working Gateway-routed-tools path from earlier in this phase keeps functioning — a
+`terraform plan` afterward confirmed zero drift. The Terraform module, IAM, and
+`GatewayPolicyDenialHookProvider` code are all believed correct and ready to re-attempt once this is
+unblocked; see [`Execution-05.md`'s Part E](Execution-05.md#part-e--agentcore-policy-ws10) for the
+full reproduction detail and recommended next steps (trying `ENFORCE` mode as a cheap differential
+test, or an AWS Support case).
+
 ## Repository map
 
 ```
@@ -918,7 +1026,7 @@ src/amc_orchestrator/
 ├── agents/
 │   ├── quant_agent.py  qual_agent.py  compliance_agent.py  revisor_agent.py  synthesizer_agent.py
 ├── observability/
-│   ├── logging_setup.py  hooks.py
+│   ├── logging_setup.py  hooks.py  # hooks.py: WS10's GatewayPolicyDenialHookProvider lives here too
 │   └── readiness.py                # check_readiness() — GET /health/ready backing logic
 ├── workflows/
 │   ├── routing.py                 # needs_revision / ready_to_synthesize condition functions
@@ -944,6 +1052,8 @@ infra/terraform/
 │   ├── s3-vectors/                # dev-only alternative to opensearch-index (vector_store_backend)
 │   ├── knowledge-base/  lambda-tools/
 │   ├── agentcore-memory/  agentcore-gateway/  agentcore-runtime/
+│   ├── agentcore-policy/          # WS10: just the policy engine — see "AgentCore Policy" above for
+│   │                               # why the Cedar policies themselves live in environments/*/main.tf instead
 │   └── observability/
 └── environments/
     ├── dev/       # cheapest defaults: no CMKs, single-AZ OpenSearch, short retention
