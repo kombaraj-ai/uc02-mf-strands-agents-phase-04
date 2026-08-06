@@ -5,10 +5,11 @@ repository (Phase 04: compliance grounding fixes + Gateway-routed tools). It is 
 followed top to bottom by someone who has just cloned the repo and knows nothing else about it.
 
 - For the local-DEV setup + AWS/CI-CD deployment mechanics that are **unchanged** since the prior
-  phase, this guide gives the full commands inline (so you don't have to jump between documents),
-  but [`Previous-Phase.md`](Previous-Phase.md) remains the authoritative, more exhaustively
-  annotated version of the CI/CD deployment flow (why OIDC, why build-once/promote, why no
-  required-reviewer gate) — read it if a step here needs more "why", not just "what".
+  phase, this guide gives the full commands inline (so you don't have to jump between documents).
+  [`ci_cd_runbook.md`](ci_cd_runbook.md) has the operational detail for the staging/prod rollout
+  specifically; [`architecture.md`](architecture.md#phase-03--cicd-github-actions) has the design
+  rationale (why OIDC, why build-once/promote, why no required-reviewer gate) if a step here needs
+  more "why", not just "what".
 - [`user_guide.md`](user_guide.md) is the full settings/API/troubleshooting reference; this guide
   is the condensed, ordered runbook.
 - For the *design* rationale behind everything, see [`architecture.md`](architecture.md).
@@ -165,9 +166,10 @@ phase — a Gateway-routed graph run that skips cleanly unless `GATEWAY_URL` is 
 ## Part B — Deploy to AWS (CI/CD)
 
 Everything in this part is **unchanged from the prior phase** — see
-[`Previous-Phase.md`](Previous-Phase.md) for the fully annotated version of each step (why OIDC,
-why build-once/promote, why no required-reviewer gate) and [`ci_cd_runbook.md`](ci_cd_runbook.md)
-for the staging/prod-specific detail. This section gives the commands in order.
+[`architecture.md`](architecture.md#phase-03--cicd-github-actions) for the fully annotated design
+rationale behind each step (why OIDC, why build-once/promote, why no required-reviewer gate) and
+[`ci_cd_runbook.md`](ci_cd_runbook.md) for the staging/prod-specific detail. This section gives the
+commands in order.
 
 ### B1. Push to GitHub (one-time)
 
@@ -246,6 +248,35 @@ in one dispatch, since dev's committed tfvars already has `enable_knowledge_base
 provisions dev completely from scratch** — do not skip B7 below, the Knowledge Base is created
 empty.
 
+> #### ⚠️ Known issue: dev's deployed container does not set `DATA_BACKEND=aws`
+>
+> `environments/dev/main.tf`'s `agentcore_runtime` module explicitly sets
+> `MODEL_PROVIDER = "bedrock"` on the deployed container, with a comment explaining why:
+> `effective_model_provider` only auto-forces Bedrock when `environment != "dev"`, and the
+> deployed container's own `ENVIRONMENT` is `"dev"`, so without this override it would try to
+> reach a local Ollama that doesn't exist inside the container. **The identical case for data was
+> never added** — `effective_data_backend` has the same `environment != "dev"` gate, so the dev
+> container resolves it to whatever `DATA_BACKEND` is set to, which defaults to `"local"` since
+> Terraform never sets it there (confirmed by inspection — no `DATA_BACKEND` entry exists in that
+> module's `environment_variables` block as of this writing).
+>
+> **Practical effect**: the *dev* deployed Runtime likely falls back to an ephemeral local
+> SQLite/Chroma store seeded with the same mock fund values, rather than genuinely reading
+> DynamoDB/the Bedrock Knowledge Base provisioned in this part — even though the numbers returned
+> look identical (the mock data is byte-for-byte the same in both stores), so this is easy to miss
+> in a smoke test. staging/prod are not affected — their `ENVIRONMENT` is `"staging"`/`"prod"`,
+> which unconditionally forces `"aws"` regardless of `DATA_BACKEND`.
+>
+> **Fix, not yet applied** (a deliberate decision, not a silent change): add one line to
+> `environments/dev/main.tf`'s `agentcore_runtime` module's `environment_variables` block,
+> mirroring the existing `MODEL_PROVIDER` line:
+>
+> ```hcl
+> DATA_BACKEND = "aws"
+> ```
+>
+> Ask if you'd like this applied before or after your next dev deploy.
+
 ### B7. Upload the initial Knowledge Base documents
 
 ```powershell
@@ -300,9 +331,8 @@ Console's Bedrock → AgentCore → Runtimes → your runtime → **Test** tab.
 
 ### B9. Staging, then prod (deferred in this phase)
 
-Not part of this phase's scope — `Previous-Phase.md`'s
-["Roll out staging, then prod"](Previous-Phase.md#step-6--roll-out-staging-then-prod) section has
-the full 8-step sequence when you're ready for it.
+Not part of this phase's scope — [`ci_cd_runbook.md`](ci_cd_runbook.md#4-stagingprod-first-ever-rollout)'s
+"Staging/prod first-ever rollout" section has the full 9-step sequence when you're ready for it.
 
 ### B10. Tear an environment down
 
