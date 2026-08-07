@@ -42,7 +42,19 @@ def test_health() -> None:
     client = TestClient(create_app())
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json()["status"] == "ok"
+    body = response.json()
+    assert body["status"] == "ok"
+    # Effective-backend fields the Streamlit UI's Local mode reads to show
+    # what this server is actually configured to do.
+    expected_fields = (
+        "model_provider",
+        "data_backend",
+        "tool_backend",
+        "gateway_url",
+        "memory_backend",
+    )
+    for field in expected_fields:
+        assert field in body
 
 
 def test_readiness_returns_200_when_ready() -> None:

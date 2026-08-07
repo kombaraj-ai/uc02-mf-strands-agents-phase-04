@@ -50,7 +50,22 @@ def create_app() -> FastAPI:
 
     @app.get("/health", tags=["health"])
     def health() -> dict[str, str]:
-        return {"status": "ok", "environment": settings.environment}
+        # Effective backends are fixed for this process's lifetime (get_settings
+        # is lru_cache'd) - exposing them lets a client (e.g. the Streamlit UI's
+        # Local mode) show what this server is actually configured to do,
+        # since there's no way to introspect a running process's env vars
+        # otherwise.
+        return {
+            "status": "ok",
+            "environment": settings.environment,
+            "model_provider": settings.effective_model_provider,
+            "data_backend": settings.effective_data_backend,
+            "tool_backend": settings.effective_tool_backend,
+            "gateway_url": (
+                settings.gateway_url if settings.effective_tool_backend == "gateway" else ""
+            ),
+            "memory_backend": settings.effective_memory_backend,
+        }
 
     @app.get("/health/ready", tags=["health"])
     def readiness(response: Response) -> dict[str, object]:

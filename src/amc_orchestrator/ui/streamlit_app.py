@@ -30,6 +30,27 @@ bucket without leaving the UI. No manual ingestion call needed afterward;
 ingestion job on upload (see `docs/sample_invocation_walkthrough.md`'s
 "S3 Auto Sync - Inner working" section).
 
+**Backend configuration is read-only here, never a live toggle** - both
+`TOOL_BACKEND`/`GATEWAY_URL` (WS8, Gateway-routed tools) and
+`MEMORY_BACKEND`/`MEMORY_ID` (WS9, AgentCore Memory) are fixed per-process
+config (`Settings` is `lru_cache`'d in the local API server; Terraform env
+vars in the deployed Runtime), not something this UI can flip on a running
+backend. Local mode reads its connected server's effective values off an
+extended `/health` payload; Runtime mode reads them straight from AWS via
+`get_agent_runtime`'s `environmentVariables` field - both are shown as an
+informational sidebar panel so a tester can see whether Gateway routing /
+Memory are actually active before assuming a run exercised them.
+
+**Session continuity control** (sidebar, works in both modes) lets a
+tester opt into passing the same session id across requests to
+demonstrate AgentCore Memory's cross-turn continuity (WS9) - Local mode
+passes it as the API's `session_id` JSON field, Runtime mode passes it as
+`invoke_agent_runtime`'s `runtimeSessionId` parameter (a real, documented
+optional param confirmed against `botocore`'s service model - AWS
+requires it to be >= 33 characters, enforced here before submitting
+rather than left to fail server-side). Off by default (stateless
+one-shot), matching prior behavior exactly when unused.
+
 Run with: `uv run streamlit run src/amc_orchestrator/ui/streamlit_app.py`
 """
 
@@ -37,6 +58,7 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from datetime import datetime
 from typing import Any
 
@@ -95,12 +117,28 @@ def fetch_json(base_url: str, path: str, timeout: float = 3.0) -> dict[str, Any]
         return None
 
 
+RUNTIME_CONFIG_KEYS = [
+    "MODEL_PROVIDER",
+    "DATA_BACKEND",
+    "TOOL_BACKEND",
+    "GATEWAY_URL",
+    "MEMORY_BACKEND",
+    "MEMORY_ID",
+]
+
+
 def fetch_runtime_status(region: str, arn: str) -> dict[str, Any] | None:
     """Check the deployed Runtime's real status via the control-plane API.
 
     `get_agent_runtime` takes an id, not the ARN `invoke_agent_runtime` uses -
     the id is just the ARN's last path segment (confirmed against a real
     Phase 02 deployment, e.g. `.../runtime/amc_orchestrator_dev_agent_runtime-X1c5y89vze`).
+
+    Also pulls `environmentVariables` off the same response - the real,
+    Terraform-applied config for this specific deployed Runtime (confirmed
+    this field exists via `botocore`'s service model), not a guess or a
+    cached local default - so the UI can show whether Gateway-routed tools
+    (WS8) / AgentCore Memory (WS9) are actually active on it.
     """
     if not arn.strip():
         return None
@@ -108,9 +146,13 @@ def fetch_runtime_status(region: str, arn: str) -> dict[str, Any] | None:
     try:
         client = boto3.client("bedrock-agentcore-control", region_name=region)
         response = client.get_agent_runtime(agentRuntimeId=runtime_id)
-        return {"status": response.get("status"), "error": None}
+        return {
+            "status": response.get("status"),
+            "error": None,
+            "environment_variables": response.get("environmentVariables") or {},
+        }
     except (ClientError, BotoCoreError) as exc:
-        return {"status": None, "error": str(exc)}
+        return {"status": None, "error": str(exc), "environment_variables": {}}
 
 
 def refresh_status() -> None:
@@ -129,6 +171,20 @@ def apply_example() -> None:
     label = st.session_state.example_select
     if label != CUSTOM_LABEL:
         st.session_state.question_text = EXAMPLE_QUESTIONS[label]
+
+
+# AWS's own `runtimeSessionId` constraint (confirmed against botocore's
+# InvokeAgentRuntime service model) - a plain str(uuid.uuid4()) is 36
+# characters, comfortably valid without padding.
+RUNTIME_SESSION_ID_MIN_LENGTH = 33
+
+
+def new_session_id() -> str:
+    return str(uuid.uuid4())
+
+
+def regenerate_session_id() -> None:
+    st.session_state.session_id_value = new_session_id()
 
 
 def status_badge(ok: bool, good_label: str, bad_label: str) -> str:
@@ -167,6 +223,23 @@ def render_local_connection() -> None:
                 st.write(("✅ " if passed else "❌ ") + check)
     if health is not None:
         st.sidebar.caption(f"Environment: `{health.get('environment', 'unknown')}`")
+        # Effective backend config for *this connected server* - read-only,
+        # sourced from /health's extended payload (api/main.py), not
+        # something this UI can change on a running process.
+        backend_bits: list[str] = [
+            f"{caption}: `{health[field]}`"
+            for field, caption in (
+                ("model_provider", "Model"),
+                ("data_backend", "Data"),
+                ("tool_backend", "Tools"),
+                ("memory_backend", "Memory"),
+            )
+            if field in health
+        ]
+        if backend_bits:
+            st.sidebar.caption(" · ".join(backend_bits))
+        if health.get("tool_backend") == "gateway" and health.get("gateway_url"):
+            st.sidebar.caption(f"Gateway URL: `{health['gateway_url']}`")
     if health is None:
         st.sidebar.warning(
             "Can't reach the API. Start it with:\n\n"
@@ -212,6 +285,15 @@ def render_runtime_connection() -> None:
             status_badge(runtime_state == "READY", label, label),
             unsafe_allow_html=True,
         )
+        # The real, Terraform-applied env vars for *this* deployed Runtime -
+        # not a guess, not this UI's own local Settings. Shows whether
+        # Gateway-routed tools (WS8) / AgentCore Memory (WS9) are active.
+        env_vars = status.get("environment_variables") or {}
+        present = {k: env_vars[k] for k in RUNTIME_CONFIG_KEYS if k in env_vars}
+        if present:
+            with st.sidebar.expander("Backend configuration (from deployed Runtime)"):
+                for key, value in present.items():
+                    st.caption(f"**{key}**: `{value}`" if value else f"**{key}**: *(empty)*")
 
 
 def upload_docs_to_s3(
@@ -329,6 +411,44 @@ def render_sidebar(settings) -> None:
     )
 
     st.sidebar.divider()
+    st.sidebar.header("Session continuity (AgentCore Memory)")
+    st.sidebar.checkbox(
+        "Use a session ID across requests",
+        key="use_session",
+        help=(
+            "Passes the same session id on every submission so a later "
+            'question can reference an earlier one (e.g. "that fund"). '
+            "Only has an effect if the connected backend actually has "
+            "MEMORY_BACKEND=agentcore active - check the backend "
+            "configuration shown above; otherwise the id is accepted but "
+            "silently has no effect (memory read/write fails soft, by "
+            "design - see docs/Execution-05.md Part D3)."
+        ),
+    )
+    if st.session_state.use_session:
+        # Explicit value= to sidestep a known Streamlit widget-lifecycle
+        # quirk (see the Runtime-mode fields above, and CLAUDE.md's Phase 02
+        # log): a key-bound widget with no value= only reliably shows a
+        # pre-populated session_state default if it's instantiated on the
+        # same script run that default was first set on - this widget only
+        # starts rendering later, once the checkbox above is checked.
+        st.sidebar.text_input(
+            "Session ID", key="session_id_value", value=st.session_state.session_id_value
+        )
+        st.sidebar.button("New session ID", on_click=regenerate_session_id, width="stretch")
+        if (
+            st.session_state.connection_mode == RUNTIME_MODE
+            and len(st.session_state.session_id_value) < RUNTIME_SESSION_ID_MIN_LENGTH
+        ):
+            st.sidebar.error(
+                f"Runtime mode requires a session id of at least "
+                f"{RUNTIME_SESSION_ID_MIN_LENGTH} characters (AWS's own "
+                f"`runtimeSessionId` constraint) - currently "
+                f"{len(st.session_state.session_id_value)}. Use 'New session ID' "
+                f"for a valid one."
+            )
+
+    st.sidebar.divider()
     st.sidebar.header("Fund reference")
     st.sidebar.dataframe(FUND_REFERENCE, hide_index=True, width="stretch")
 
@@ -336,7 +456,7 @@ def render_sidebar(settings) -> None:
     render_docs_admin()
 
 
-def render_result(outcome: dict[str, Any], elapsed: float) -> None:
+def render_result(outcome: dict[str, Any], elapsed: float, session_id: str | None = None) -> None:
     escalated = bool(outcome.get("escalated"))
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -351,6 +471,8 @@ def render_result(outcome: dict[str, Any], elapsed: float) -> None:
         st.metric("Elapsed time", f"{elapsed:.1f}s")
 
     st.caption(f"Graph status: `{outcome.get('graph_status', 'unknown')}`")
+    if session_id:
+        st.caption(f"Session: `{session_id}`")
 
     if escalated:
         st.info(
@@ -366,11 +488,16 @@ def render_result(outcome: dict[str, Any], elapsed: float) -> None:
         st.json(outcome)
 
 
-def submit_rfp_local(base_url: str, question: str, timeout: float) -> tuple[dict[str, Any], float]:
+def submit_rfp_local(
+    base_url: str, question: str, timeout: float, session_id: str | None = None
+) -> tuple[dict[str, Any], float]:
+    payload: dict[str, Any] = {"question": question}
+    if session_id:
+        payload["session_id"] = session_id
     start = time.perf_counter()
     response = httpx.post(
         f"{base_url}/api/v1/rfp",
-        json={"question": question},
+        json=payload,
         timeout=timeout,
     )
     elapsed = time.perf_counter() - start
@@ -379,25 +506,34 @@ def submit_rfp_local(base_url: str, question: str, timeout: float) -> tuple[dict
 
 
 def submit_rfp_runtime(
-    region: str, arn: str, question: str, timeout: float
+    region: str, arn: str, question: str, timeout: float, session_id: str | None = None
 ) -> tuple[dict[str, Any], float]:
     """Invoke the deployed AgentCore Runtime directly via SigV4-signed boto3.
 
     `invoke_agent_runtime`'s response body is the exact same `RfpOutcome`
     JSON `runtime_entrypoint.py`'s `invoke()` returns - no separate parsing
     needed, `render_result` handles it identically to the local API path.
+
+    `runtimeSessionId`, when supplied, is AWS's own real cross-turn session
+    identity (confirmed against botocore's InvokeAgentRuntime service model,
+    not the JSON payload) - `runtime_entrypoint.py`'s `invoke()` reads it
+    back as `context.session_id`, the same value AgentCore Memory (WS9)
+    read/write keys off of.
     """
     client = boto3.client(
         "bedrock-agentcore",
         region_name=region,
         config=BotoConfig(connect_timeout=min(timeout, 30), read_timeout=timeout),
     )
+    kwargs: dict[str, Any] = {
+        "agentRuntimeArn": arn,
+        "payload": json.dumps({"prompt": question}).encode("utf-8"),
+        "contentType": "application/json",
+    }
+    if session_id:
+        kwargs["runtimeSessionId"] = session_id
     start = time.perf_counter()
-    response = client.invoke_agent_runtime(
-        agentRuntimeArn=arn,
-        payload=json.dumps({"prompt": question}).encode("utf-8"),
-        contentType="application/json",
-    )
+    response = client.invoke_agent_runtime(**kwargs)
     body = response["response"].read()
     elapsed = time.perf_counter() - start
     return json.loads(body), elapsed
@@ -422,6 +558,10 @@ def main() -> None:
         st.session_state.agent_runtime_arn = ""
     if "kb_docs_bucket" not in st.session_state:
         st.session_state.kb_docs_bucket = ""
+    if "use_session" not in st.session_state:
+        st.session_state.use_session = False
+    if "session_id_value" not in st.session_state:
+        st.session_state.session_id_value = new_session_id()
     if "request_timeout" not in st.session_state:
         st.session_state.request_timeout = 600
     if "question_text" not in st.session_state:
@@ -453,10 +593,20 @@ def main() -> None:
     if submitted:
         question = st.session_state.question_text.strip()
         mode = st.session_state.connection_mode
+        session_id = st.session_state.session_id_value if st.session_state.use_session else None
         if not question:
             st.error("Enter a question before submitting.")
         elif mode == RUNTIME_MODE and not st.session_state.agent_runtime_arn.strip():
             st.error("Enter an Agent Runtime ARN in the sidebar first.")
+        elif (
+            mode == RUNTIME_MODE
+            and session_id
+            and len(session_id) < RUNTIME_SESSION_ID_MIN_LENGTH
+        ):
+            st.error(
+                f"Session ID must be at least {RUNTIME_SESSION_ID_MIN_LENGTH} characters "
+                "for Runtime mode - use 'New session ID' in the sidebar."
+            )
         else:
             spinner_text = "Running quant + qual retrieval, compliance review, and synthesis - " + (
                 "this can take several minutes on DEV Ollama..."
@@ -468,7 +618,7 @@ def main() -> None:
                     if mode == LOCAL_MODE:
                         base_url = st.session_state.api_base_url.rstrip("/")
                         outcome, elapsed = submit_rfp_local(
-                            base_url, question, st.session_state.request_timeout
+                            base_url, question, st.session_state.request_timeout, session_id
                         )
                     else:
                         outcome, elapsed = submit_rfp_runtime(
@@ -476,6 +626,7 @@ def main() -> None:
                             st.session_state.agent_runtime_arn.strip(),
                             question,
                             st.session_state.request_timeout,
+                            session_id,
                         )
             except httpx.ConnectError:
                 st.error(
@@ -512,9 +663,10 @@ def main() -> None:
                         "question": question,
                         "outcome": outcome,
                         "elapsed": elapsed,
+                        "session_id": session_id,
                     },
                 )
-                render_result(outcome, elapsed)
+                render_result(outcome, elapsed, session_id)
 
     history = st.session_state.get("history", [])
     if history:
@@ -524,10 +676,13 @@ def main() -> None:
                 escalated = entry["outcome"].get("escalated")
                 icon = "⛔" if escalated else "✅"
                 st.markdown(f"**{entry['time']}** {icon} — {entry['question']}")
-                st.caption(
+                caption = (
                     f"Attempts: {entry['outcome'].get('compliance_attempts')} · "
                     f"Elapsed: {entry['elapsed']:.1f}s"
                 )
+                if entry.get("session_id"):
+                    caption += f" · Session: `{entry['session_id']}`"
+                st.caption(caption)
                 st.divider()
 
 
