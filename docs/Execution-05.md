@@ -74,12 +74,26 @@ and knows nothing else about it.
    confirmed correct every way it can be checked, root-caused as far as possible without an AWS
    Support case. `environments/dev` currently has Policy detached (`enable_policy=false`) to keep
    the already-working Gateway-routed-tools path (WS8) functional.
-6. **Current AWS state**: `environments/dev` is **live** — WS8, WS9, and (partially — see above)
-   WS10 have all been exercised against it in turn, most recently with a rebuilt image (tag
-   `30bee40-ws9`) carrying WS9's memory-wiring code; WS10 only ever touched infrastructure
-   (Policy resources), not the container image. Confirm with `terraform state list` in
-   `environments/dev` before assuming either way if picking this up later; it may have been torn
-   down since.
+6. **Current AWS state, re-confirmed 2026-08-07: everything is torn down, not just `environments/dev`.**
+   A direct AWS API sweep (ECR, DynamoDB, S3, Lambda, IAM, OpenSearch Serverless, S3 Vectors,
+   Bedrock Knowledge Bases, SQS, CloudWatch, SNS, and the AgentCore Runtime/Gateway/Memory
+   list-APIs themselves — not just `terraform state list`, which can't be trusted alone, see next
+   point) found zero resources belonging to this project anywhere in the account. This is a wider
+   teardown than any single session above documented on its own: `github-oidc/`'s OIDC provider and
+   all four IAM roles are gone too, not just `dev`'s application resources.
+   **Also gone: the Terraform state S3 bucket itself** (`amc-orchestrator-tfstate-766354255780`) —
+   confirmed via `head-bucket` (404) and absent from `list-buckets`. This is the *same* failure mode
+   already logged once in this file's history (mid-WS5: "the Terraform state S3 bucket had been
+   deleted from AWS entirely... cause unknown") — it has now happened a second time, still with no
+   known cause (not a Terraform destroy — `bootstrap/`'s local `terraform.tfstate` still listed the
+   bucket as existing, meaning it was deleted out-of-band). **Practical effect**: `bootstrap/` needs
+   a fresh `terraform apply` before `github-oidc/` or any environment can be touched again — see the
+   updated B2 below, which now accounts for this instead of assuming a clean first-ever bootstrap.
+   `github-oidc/terraform.tfvars` was also found to still reference a **stale repo name**
+   (`AMC-RFP-Phase3`, from before the project moved to its current remote,
+   `kombaraj-ai/uc02-mf-strands-agents-phase-04`) — fixed in the tracked file as part of this same
+   pass, see B3's note. Left unfixed, it would have scoped the OIDC trust policy to the wrong repo
+   and silently broken every CI-triggered deploy with no obvious error message pointing at the cause.
 
 ---
 
@@ -93,7 +107,8 @@ and knows nothing else about it.
 | Bedrock model access granted for `amazon.nova-lite-v1:0` + the Titan V2 embedding model, in your target region | Account-level opt-in in the Bedrock console — Terraform cannot grant this | Bedrock console → Model access |
 | [Terraform](https://developer.hashicorp.com/terraform) **v1.15.7** (pinned `>= 1.15.7, < 2.0.0`) | The two one-time local applies, and any manual `terraform validate`/`plan` | `terraform version` |
 | A GitHub repository you administer, with this code pushed to `main` | CI/CD runs from GitHub Actions against this repo | `git remote -v` |
-| `aws` CLI v2, `docker`, `boto3` | Post-deploy smoke testing, document uploads, image build/push | `aws --version`, `docker --version` |
+| `aws` CLI v2, `docker`, `boto3` | Post-deploy smoke testing, document uploads, image build/push. **Older `aws` CLI builds (confirmed on `aws-cli/2.15.17`) don't have the `bedrock-agentcore-control`/`bedrock-agentcore` command groups at all** — B8 has the boto3 fallback for the one step this affects | `aws --version`, `docker --version` |
+| `gh` CLI (optional) | Convenience for dispatching `deploy.yml` from a terminal (B6) — **confirmed not installed on this project's own dev machine**; the GitHub web UI's Actions tab works identically and is the fallback used throughout this guide when `gh` isn't available | `gh --version` |
 
 ---
 
@@ -206,11 +221,27 @@ git push -u origin main
 
 The OIDC trust policies applied in B3 are scoped to this exact `org/repo` — do this first.
 
-### B2. Bootstrap the Terraform state backend (one-time, local)
+### B2. Bootstrap the Terraform state backend (one-time, local — or re-run if the bucket vanished)
 
 ```powershell
 cd infra/terraform/bootstrap
 terraform init
+terraform plan
+```
+
+**Run `plan` before `apply` here, don't assume this is a clean first-ever bootstrap.** If a prior
+session already ran this once, `bootstrap/`'s local `terraform.tfstate` (this module can't use the
+S3 backend for itself — chicken-and-egg) may be stale relative to real AWS: this has happened
+**twice** in this project's history, most recently confirmed 2026-08-07 (see the "Current AWS
+state" note above) — the state bucket was deleted outside Terraform entirely, with the cause
+unknown both times. If so, `plan` will show `Note: Objects have changed outside of Terraform` /
+`aws_s3_bucket.state has been deleted`, followed by a clean **6 to add, 0 to change, 0 to destroy**
+(bucket + lifecycle config + policy + public access block + encryption config + versioning) — that
+plan is safe to apply, it's just recreating the same deterministically-named bucket. If `plan`
+instead errors or shows something other than a clean 6-resource create, stop and investigate before
+applying — don't assume it'll self-heal.
+
+```powershell
 terraform apply
 terraform output state_bucket_name      # note this — every backend.hcl below needs it
 terraform output state_bucket_region
@@ -220,13 +251,25 @@ terraform output state_bucket_region
 
 ```powershell
 cd ../github-oidc
-Copy-Item backend.hcl.example backend.hcl
-Copy-Item terraform.tfvars.example terraform.tfvars
+Copy-Item backend.hcl.example backend.hcl        # skip if backend.hcl already exists locally
 ```
 
-Edit `terraform.tfvars` (`github_org`, `github_repo`, `state_bucket_name` from B2) and
-`backend.hcl` (`bucket` = same state bucket name, `key = "github-oidc/terraform.tfstate"`,
-`region = "us-east-1"`), then:
+`terraform.tfvars` (unlike `backend.hcl`) **is tracked in git**, not gitignored — on an existing
+checkout it likely already has real values, not the `.tfvars.example` placeholder. **Don't assume
+it's still correct without checking**: this file was found stale on 2026-08-07 (`github_repo` still
+pointed at `AMC-RFP-Phase3`, the repo's name *before* it moved to its current remote), which would
+silently scope the OIDC trust policy to the wrong repo and break every CI-triggered deploy with no
+obvious error. Verify it matches reality before applying:
+
+```powershell
+git remote -v                    # confirm the actual org/repo this checkout pushes to
+Get-Content terraform.tfvars     # compare github_org / github_repo against that
+```
+
+If it's a genuinely fresh checkout with no `terraform.tfvars` yet: `Copy-Item
+terraform.tfvars.example terraform.tfvars`, then edit `github_org`, `github_repo`,
+`state_bucket_name` (from B2). Either way, also fill in `backend.hcl` (`bucket` = same state
+bucket name, `key = "github-oidc/terraform.tfstate"`, `region = "us-east-1"`), then:
 
 ```powershell
 terraform init -backend-config=backend.hcl
@@ -237,6 +280,13 @@ terraform output deploy_role_arns
 ```
 
 Keep all four ARNs (`plan_role_arn`, `deploy_role_arns["dev"|"staging"|"prod"]`) — needed next.
+
+If this checkout previously had a live `github-oidc` deployment that's now gone (per the "Current
+AWS state" note above), `plan` here should show a plain **N to add, 0 to change, 0 to destroy** —
+both the real AWS resources and this module's own remote state are confirmed gone together, so
+there's no orphaned-resource reconciliation needed (unlike an earlier incident in this project's
+history where the state alone went missing while the real resources kept running, which needed
+`import` blocks to fix — not the situation here).
 
 ### B4. Create the three GitHub Environments
 
@@ -263,7 +313,10 @@ CI/CD is now fully wired — nothing has touched application AWS resources yet.
 gh workflow run deploy.yml -f environment=dev
 ```
 
-(Or: Actions tab → **Deploy** → **Run workflow** → `environment = dev`.)
+**If `gh` isn't installed** (confirmed absent from this project's own dev machine, 2026-08-07 —
+`gh: command not found`), skip straight to the fallback: **Actions tab → Deploy → Run workflow →
+`environment = dev`**, in the GitHub web UI. Don't assume `gh` is available just because the doc
+leads with it.
 
 This runs `ensure-ecr` (idempotent ECR repo creation) → `build-and-push` (builds a
 `linux/arm64` image, tags with the git SHA, pushes) → `terraform-apply` (all three phased passes
@@ -274,34 +327,28 @@ in one dispatch, since dev's committed tfvars already has `enable_knowledge_base
 provisions dev completely from scratch** — do not skip B7 below, the Knowledge Base is created
 empty.
 
-> #### ⚠️ Known issue: dev's deployed container does not set `DATA_BACKEND=aws`
+> #### ✅ Fixed 2026-08-07: dev's deployed container now sets `DATA_BACKEND=aws`
 >
 > `environments/dev/main.tf`'s `agentcore_runtime` module explicitly sets
 > `MODEL_PROVIDER = "bedrock"` on the deployed container, with a comment explaining why:
 > `effective_model_provider` only auto-forces Bedrock when `environment != "dev"`, and the
 > deployed container's own `ENVIRONMENT` is `"dev"`, so without this override it would try to
-> reach a local Ollama that doesn't exist inside the container. **The identical case for data was
-> never added** — `effective_data_backend` has the same `environment != "dev"` gate, so the dev
-> container resolves it to whatever `DATA_BACKEND` is set to, which defaults to `"local"` since
-> Terraform never sets it there (confirmed by inspection — no `DATA_BACKEND` entry exists in that
-> module's `environment_variables` block as of this writing).
+> reach a local Ollama that doesn't exist inside the container. **The identical case for data had
+> never been added** — `effective_data_backend` has the same `environment != "dev"` gate, so the
+> dev container previously resolved it to whatever `DATA_BACKEND` was set to, which defaulted to
+> `"local"` since Terraform never set it there. Practical effect of the bug: the *dev* deployed
+> Runtime silently fell back to an ephemeral local SQLite/Chroma store seeded with the same mock
+> fund values, rather than genuinely reading DynamoDB/the Bedrock Knowledge Base — the numbers
+> returned looked identical (the mock data is byte-for-byte the same in both stores), so this was
+> easy to miss in a smoke test. staging/prod were never affected — their `ENVIRONMENT` is
+> `"staging"`/`"prod"`, which unconditionally forces `"aws"` regardless of `DATA_BACKEND`.
 >
-> **Practical effect**: the *dev* deployed Runtime likely falls back to an ephemeral local
-> SQLite/Chroma store seeded with the same mock fund values, rather than genuinely reading
-> DynamoDB/the Bedrock Knowledge Base provisioned in this part — even though the numbers returned
-> look identical (the mock data is byte-for-byte the same in both stores), so this is easy to miss
-> in a smoke test. staging/prod are not affected — their `ENVIRONMENT` is `"staging"`/`"prod"`,
-> which unconditionally forces `"aws"` regardless of `DATA_BACKEND`.
->
-> **Fix, not yet applied** (a deliberate decision, not a silent change): add one line to
+> **Now fixed**: `DATA_BACKEND = "aws"` was added to
 > `environments/dev/main.tf`'s `agentcore_runtime` module's `environment_variables` block,
-> mirroring the existing `MODEL_PROVIDER` line:
->
-> ```hcl
-> DATA_BACKEND = "aws"
-> ```
->
-> Ask if you'd like this applied before or after your next dev deploy.
+> mirroring the existing `MODEL_PROVIDER` line — `terraform fmt`/`validate` clean, not yet
+> committed as of this writing. Confirm it's present before your next `dev` apply
+> (`git diff infra/terraform/environments/dev/main.tf` if unsure, or just `grep DATA_BACKEND` in
+> that file).
 
 ### B7. Upload the initial Knowledge Base documents
 
@@ -336,6 +383,18 @@ $job.ingestionJob.statistics   # expect numberOfNewDocumentsIndexed: 4, numberOf
 $runtimeArn = terraform output -raw agent_runtime_arn
 aws bedrock-agentcore-control get-agent-runtime --agent-runtime-id ($runtimeArn -split '/')[-1] --region us-east-1
 ```
+
+> **If this errors with `Invalid choice: 'bedrock-agentcore-control'`**: your `aws` CLI is too old —
+> confirmed on this project's own dev machine (`aws-cli/2.15.17` neither has `bedrock-agentcore-control`
+> nor `bedrock-agentcore` as valid command groups at all, 2026-08-07). Either upgrade the CLI, or use
+> the equivalent boto3 call instead:
+> ```python
+> import boto3
+> client = boto3.client("bedrock-agentcore-control", region_name="us-east-1")
+> print(client.get_agent_runtime(agentRuntimeId="<runtime id, last path segment of the ARN>"))
+> ```
+> The `invoke_agent_runtime` call right below uses the `bedrock-agentcore` (data-plane) client, which
+> boto3 has supported for longer than the CLI has surfaced it — that one is unaffected by this gap.
 
 ```python
 import boto3, json
