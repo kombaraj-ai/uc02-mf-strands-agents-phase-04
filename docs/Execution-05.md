@@ -139,6 +139,16 @@ case, DEV can opt into Bedrock instead — see
 [Switching model provider](user_guide.md#switching-model-provider-ollama-vs-bedrock) in the full
 user guide.
 
+> **If you do opt into local Bedrock** (`MODEL_PROVIDER=bedrock`), override `BEDROCK_MODEL_ID` first.
+> `environments/.env.dev.example`'s default (`anthropic.claude-3-5-sonnet-20241022-v2:0`) is the
+> same model ID that was confirmed end-of-life on Bedrock back in Phase 02
+> (`ResourceNotFoundException`) — `infra/terraform/environments/dev/terraform.tfvars` was fixed to
+> `amazon.nova-lite-v1:0` for the *deployed* Runtime at the time, but the local example env file and
+> `Settings.bedrock_model_id`'s own code default were never updated to match. Set
+> `BEDROCK_MODEL_ID=amazon.nova-lite-v1:0` (or another currently-`ON_DEMAND`-invokable model) in
+> `environments/.env.dev` before running locally against Bedrock, or you'll hit the same
+> `ResourceNotFoundException`.
+
 ### A2. Run one query via the CLI (no server needed)
 
 ```powershell
@@ -343,12 +353,11 @@ empty.
 > easy to miss in a smoke test. staging/prod were never affected — their `ENVIRONMENT` is
 > `"staging"`/`"prod"`, which unconditionally forces `"aws"` regardless of `DATA_BACKEND`.
 >
-> **Now fixed**: `DATA_BACKEND = "aws"` was added to
+> **Now fixed and committed** (`f894578`, 2026-08-07): `DATA_BACKEND = "aws"` was added to
 > `environments/dev/main.tf`'s `agentcore_runtime` module's `environment_variables` block,
-> mirroring the existing `MODEL_PROVIDER` line — `terraform fmt`/`validate` clean, not yet
-> committed as of this writing. Confirm it's present before your next `dev` apply
-> (`git diff infra/terraform/environments/dev/main.tf` if unsure, or just `grep DATA_BACKEND` in
-> that file).
+> mirroring the existing `MODEL_PROVIDER` line. Confirmed present in the current `main` branch — no
+> action needed, this note is left here only as a pointer if a future change to that file ever
+> regresses it (`grep DATA_BACKEND infra/terraform/environments/dev/main.tf` to check).
 
 ### B7. Upload the initial Knowledge Base documents
 
