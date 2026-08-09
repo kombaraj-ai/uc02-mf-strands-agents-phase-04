@@ -50,8 +50,9 @@ def test_ensure_seeded_reraises_unexpected_client_errors() -> None:
         {"Error": {"Code": "ProvisionedThroughputExceededException"}}, "PutItem"
     )
 
-    with patch("amc_orchestrator.data.dynamodb_store._table", return_value=table), pytest.raises(
-        ClientError
+    with (
+        patch("amc_orchestrator.data.dynamodb_store._table", return_value=table),
+        pytest.raises(ClientError),
     ):
         dynamodb_store.ensure_seeded("test-table")
 

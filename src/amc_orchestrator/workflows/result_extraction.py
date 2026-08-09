@@ -27,7 +27,7 @@ class RfpOutcome:
     graph_status: str
 
 
-def summarize_result(result: "GraphResult") -> RfpOutcome:
+def summarize_result(result: GraphResult) -> RfpOutcome:
     """Translate a raw `GraphResult` into an `RfpOutcome` for callers."""
     graph_status = result.status.value if hasattr(result.status, "value") else str(result.status)
 
@@ -48,11 +48,11 @@ def summarize_result(result: "GraphResult") -> RfpOutcome:
     response_text = str(synthesis_node_result.result)
 
     compliance_node_result = result.results.get(COMPLIANCE_NODE)
-    final_verdict = (
-        getattr(compliance_node_result.result, "structured_output", None)
-        if compliance_node_result is not None and not isinstance(compliance_node_result.result, Exception)
-        else None
-    )
+    final_verdict = None
+    if compliance_node_result is not None and not isinstance(
+        compliance_node_result.result, Exception
+    ):
+        final_verdict = getattr(compliance_node_result.result, "structured_output", None)
     escalated = final_verdict is None or final_verdict.status != "APPROVED"
 
     return RfpOutcome(

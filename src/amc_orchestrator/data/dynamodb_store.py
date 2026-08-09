@@ -56,4 +56,6 @@ def fetch_fund_performance(table_name: str, ticker: str) -> dict[str, Any] | Non
     item = response.get("Item")
     if item is None:
         return None
-    return {key: float(value) if isinstance(value, Decimal) else value for key, value in item.items()}
+    return {
+        key: float(value) if isinstance(value, Decimal) else value for key, value in item.items()
+    }

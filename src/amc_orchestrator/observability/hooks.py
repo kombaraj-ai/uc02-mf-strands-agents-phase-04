@@ -88,7 +88,9 @@ class QualGroundingHookProvider(HookProvider):
     """
 
     NOT_FOUND_SENTINEL = "No relevant fund manager commentary found for this query."
-    NO_COMMENTARY_RESPONSE = "No relevant fund manager commentary was found for any fund in this request."
+    NO_COMMENTARY_RESPONSE = (
+        "No relevant fund manager commentary was found for any fund in this request."
+    )
     _TOOL_NAME = "search_fund_commentary"
 
     def __init__(self) -> None:

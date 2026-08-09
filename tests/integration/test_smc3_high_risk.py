@@ -30,7 +30,8 @@ from amc_orchestrator.workflows.result_extraction import summarize_exception, su
 pytestmark = pytest.mark.integration
 
 _FORBIDDEN_LANGUAGE = re.compile(
-    r"\b(guarantee[sd]?|promise[sd]?|risk[- ]free|foolproof|will sustain|will continue to (deliver|outperform))\b",
+    r"\b(guarantee[sd]?|promise[sd]?|risk[- ]free|foolproof|will sustain|"
+    r"will continue to (deliver|outperform))\b",
     re.IGNORECASE,
 )
 

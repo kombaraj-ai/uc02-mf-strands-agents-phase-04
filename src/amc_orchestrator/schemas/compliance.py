@@ -18,7 +18,9 @@ class ComplianceVerdict(BaseModel):
     """
 
     status: Literal["APPROVED", "REJECTED"] = Field(
-        description="APPROVED if the evaluated text fully satisfies the compliance rubric, else REJECTED."
+        description=(
+            "APPROVED if the evaluated text fully satisfies the compliance rubric, else REJECTED."
+        )
     )
     violations: list[str] = Field(
         default_factory=list,
@@ -26,7 +28,9 @@ class ComplianceVerdict(BaseModel):
     )
     suggested_edits: str = Field(
         default="",
-        description="Concrete, actionable edits to resolve the violations. Empty when status is APPROVED.",
+        description=(
+            "Concrete, actionable edits to resolve the violations. Empty when status is APPROVED."
+        ),
     )
     evaluated_text: str = Field(
         description="Verbatim copy of the exact narrative text that was judged, unchanged, in full."

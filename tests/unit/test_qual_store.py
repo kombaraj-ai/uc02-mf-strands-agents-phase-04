@@ -29,9 +29,7 @@ def test_local_backend_dispatches_to_chroma_store() -> None:
 
 
 def test_aws_backend_dispatches_to_knowledge_base_store() -> None:
-    settings = Settings(
-        environment="dev", data_backend="aws", bedrock_knowledge_base_id="kb-123"
-    )
+    settings = Settings(environment="dev", data_backend="aws", bedrock_knowledge_base_id="kb-123")
 
     with patch(
         "amc_orchestrator.data.qual_store.knowledge_base_store.search_commentary",
@@ -55,8 +53,6 @@ def test_ensure_seeded_dispatches_by_backend() -> None:
         local_settings.chroma_full_path, local_settings.chroma_collection_name
     )
 
-    with patch(
-        "amc_orchestrator.data.qual_store.knowledge_base_store.ensure_seeded"
-    ) as aws_mock:
+    with patch("amc_orchestrator.data.qual_store.knowledge_base_store.ensure_seeded") as aws_mock:
         qual_store.ensure_seeded(aws_settings)
     aws_mock.assert_called_once_with("kb-123")

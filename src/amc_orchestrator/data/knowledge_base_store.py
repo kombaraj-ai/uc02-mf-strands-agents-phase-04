@@ -11,8 +11,8 @@ would duplicate infrastructure that already does the job.
 
 from __future__ import annotations
 
-import structlog
 import boto3
+import structlog
 
 logger = structlog.get_logger(__name__)
 
@@ -48,9 +48,7 @@ def search_commentary(
     response = _client(region).retrieve(
         knowledgeBaseId=knowledge_base_id,
         retrievalQuery={"text": query},
-        retrievalConfiguration={
-            "vectorSearchConfiguration": {"numberOfResults": n_results}
-        },
+        retrievalConfiguration={"vectorSearchConfiguration": {"numberOfResults": n_results}},
     )
     results = response.get("retrievalResults", [])
     return [r["content"]["text"] for r in results if r.get("content", {}).get("text")]

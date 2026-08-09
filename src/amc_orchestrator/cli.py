@@ -33,7 +33,8 @@ def bootstrap_dev_data() -> None:
 
 def run_rfp_query(question: str, session_id: str | None = None) -> None:
     settings = get_settings()
-    configure_logging(level=settings.log_level, fmt="console" if settings.environment == "dev" else "json")
+    fmt = "console" if settings.environment == "dev" else "json"
+    configure_logging(level=settings.log_level, fmt=fmt)
     bind_trace_context(trace_id=str(uuid.uuid4()))
 
     bootstrap_dev_data()

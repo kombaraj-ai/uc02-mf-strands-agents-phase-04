@@ -24,7 +24,9 @@ def test_search_commentary_returns_relevant_smallcap_doc(chroma_dir: Path) -> No
 
 def test_search_commentary_on_empty_collection_returns_empty_list(chroma_dir: Path) -> None:
     # Collection created but never seeded.
-    results = chroma_store.search_commentary(chroma_dir, "empty_collection", "anything", n_results=1)
+    results = chroma_store.search_commentary(
+        chroma_dir, "empty_collection", "anything", n_results=1
+    )
     assert results == []
 
 

@@ -40,9 +40,10 @@ def configure_logging(level: str = "INFO", fmt: str = "json") -> None:
     else:
         renderer = structlog.processors.JSONRenderer()
 
+    level_no = logging.getLevelNamesMapping().get(level.upper(), logging.INFO)
     structlog.configure(
         processors=[*shared_processors, structlog.processors.format_exc_info, renderer],
-        wrapper_class=structlog.make_filtering_bound_logger(logging.getLevelNamesMapping().get(level.upper(), logging.INFO)),
+        wrapper_class=structlog.make_filtering_bound_logger(level_no),
         context_class=dict,
         logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
         cache_logger_on_first_use=True,

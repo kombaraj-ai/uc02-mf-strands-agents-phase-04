@@ -42,7 +42,9 @@ def test_get_fund_performance_returns_json_metrics(isolated_settings: Settings) 
     assert payload["standard_deviation"] == 22.80
 
 
-def test_get_fund_performance_unknown_ticker_returns_error_payload(isolated_settings: Settings) -> None:
+def test_get_fund_performance_unknown_ticker_returns_error_payload(
+    isolated_settings: Settings,
+) -> None:
     from amc_orchestrator.tools.quant_tools import get_fund_performance
 
     payload = json.loads(get_fund_performance("ZZZZ"))

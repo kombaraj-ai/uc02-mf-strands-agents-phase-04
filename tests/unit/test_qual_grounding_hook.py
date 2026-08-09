@@ -64,7 +64,9 @@ def test_leaves_response_untouched_when_real_commentary_was_found() -> None:
     result = _agent_result("A narrative grounded in the retrieved commentary.")
     provider._on_after_invocation(AfterInvocationEvent(agent=agent, result=result))
 
-    assert result.message["content"] == [{"text": "A narrative grounded in the retrieved commentary."}]
+    assert result.message["content"] == [
+        {"text": "A narrative grounded in the retrieved commentary."}
+    ]
 
 
 def test_leaves_response_untouched_when_tool_never_called() -> None:
@@ -163,4 +165,6 @@ def test_state_does_not_leak_between_separate_agents() -> None:
     provider._on_after_invocation(AfterInvocationEvent(agent=agent_b, result=result_b))
 
     assert result_a.message["content"] == [{"text": "Response for A."}]
-    assert result_b.message["content"] == [{"text": QualGroundingHookProvider.NO_COMMENTARY_RESPONSE}]
+    assert result_b.message["content"] == [
+        {"text": QualGroundingHookProvider.NO_COMMENTARY_RESPONSE}
+    ]

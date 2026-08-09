@@ -82,7 +82,11 @@ STATUS_MUTED = "#898781"
 
 FUND_REFERENCE = [
     {"Ticker": "EQG1", "Fund": "Global Equity Growth Fund", "Category": "Largecap"},
-    {"Ticker": "SMC3", "Fund": "Alpha Prime Smallcap Direct Fund", "Category": "Smallcap / high-risk"},
+    {
+        "Ticker": "SMC3",
+        "Fund": "Alpha Prime Smallcap Direct Fund",
+        "Category": "Smallcap / high-risk",
+    },
     {"Ticker": "INC2", "Fund": "Fixed Income Core Bond Fund", "Category": "Debt / Conservative"},
     {"Ticker": "BLN4", "Fund": "Balanced Conservative Wealth Fund", "Category": "Hybrid"},
 ]
@@ -212,7 +216,9 @@ def render_local_connection() -> None:
     health = st.session_state.get("health")
     readiness = st.session_state.get("readiness")
 
-    st.sidebar.markdown(status_badge(health is not None, "API online", "API unreachable"), unsafe_allow_html=True)
+    st.sidebar.markdown(
+        status_badge(health is not None, "API online", "API unreachable"), unsafe_allow_html=True
+    )
     if readiness is not None:
         st.sidebar.markdown(
             status_badge(bool(readiness.get("ready")), "Ready", "Not ready"),
@@ -242,8 +248,7 @@ def render_local_connection() -> None:
             st.sidebar.caption(f"Gateway URL: `{health['gateway_url']}`")
     if health is None:
         st.sidebar.warning(
-            "Can't reach the API. Start it with:\n\n"
-            "`uv run python -m amc_orchestrator.main`",
+            "Can't reach the API. Start it with:\n\n`uv run python -m amc_orchestrator.main`",
             icon="⚠️",
         )
 
@@ -296,9 +301,7 @@ def render_runtime_connection() -> None:
                     st.caption(f"**{key}**: `{value}`" if value else f"**{key}**: *(empty)*")
 
 
-def upload_docs_to_s3(
-    region: str, bucket: str, files: list
-) -> list[tuple[str, bool, str | None]]:
+def upload_docs_to_s3(region: str, bucket: str, files: list) -> list[tuple[str, bool, str | None]]:
     """Upload each file as-is to the KB docs bucket via a direct S3 PutObject.
 
     Uses whatever AWS credentials are already active, same as Runtime mode.
@@ -350,7 +353,10 @@ def render_docs_admin() -> None:
             "Fund commentary documents",
             accept_multiple_files=True,
             key="kb_upload_widget",
-            help="Uploaded as-is to the KB docs bucket; auto-sync ingestion picks them up within ~5 minutes.",
+            help=(
+                "Uploaded as-is to the KB docs bucket; auto-sync ingestion picks them up "
+                "within ~5 minutes."
+            ),
         )
         bucket = st.session_state.kb_docs_bucket.strip()
 
@@ -599,9 +605,7 @@ def main() -> None:
         elif mode == RUNTIME_MODE and not st.session_state.agent_runtime_arn.strip():
             st.error("Enter an Agent Runtime ARN in the sidebar first.")
         elif (
-            mode == RUNTIME_MODE
-            and session_id
-            and len(session_id) < RUNTIME_SESSION_ID_MIN_LENGTH
+            mode == RUNTIME_MODE and session_id and len(session_id) < RUNTIME_SESSION_ID_MIN_LENGTH
         ):
             st.error(
                 f"Session ID must be at least {RUNTIME_SESSION_ID_MIN_LENGTH} characters "

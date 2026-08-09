@@ -20,7 +20,9 @@ def _node(node_id: str) -> SimpleNamespace:
 
 
 def _node_result(verdict: ComplianceVerdict | None) -> SimpleNamespace:
-    agent_result = SimpleNamespace(structured_output=verdict) if verdict is not None else SimpleNamespace()
+    agent_result = (
+        SimpleNamespace(structured_output=verdict) if verdict is not None else SimpleNamespace()
+    )
     return SimpleNamespace(result=agent_result)
 
 
@@ -35,12 +37,17 @@ def _state(execution_order: list[str], verdict: ComplianceVerdict | None) -> Sim
 
 
 def _approved(text: str = "draft") -> ComplianceVerdict:
-    return ComplianceVerdict(status="APPROVED", violations=[], suggested_edits="", evaluated_text=text)
+    return ComplianceVerdict(
+        status="APPROVED", violations=[], suggested_edits="", evaluated_text=text
+    )
 
 
 def _rejected(text: str = "draft") -> ComplianceVerdict:
     return ComplianceVerdict(
-        status="REJECTED", violations=["NO GUARANTEES"], suggested_edits="soften language", evaluated_text=text
+        status="REJECTED",
+        violations=["NO GUARANTEES"],
+        suggested_edits="soften language",
+        evaluated_text=text,
     )
 
 
@@ -64,7 +71,13 @@ def test_rejected_after_exhausting_attempts_forces_synthesis() -> None:
     needs_revision, ready_to_synthesize = build_routing_conditions(max_attempts=2)
     # compliance_check has already run twice (>= max_attempts) and is still REJECTED.
     state = _state(
-        ["quant_data_pull", "qual_narrative_pull", COMPLIANCE_NODE, "revise_draft", COMPLIANCE_NODE],
+        [
+            "quant_data_pull",
+            "qual_narrative_pull",
+            COMPLIANCE_NODE,
+            "revise_draft",
+            COMPLIANCE_NODE,
+        ],
         _rejected(),
     )
 

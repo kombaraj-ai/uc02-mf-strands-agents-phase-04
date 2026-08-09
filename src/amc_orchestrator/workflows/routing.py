@@ -43,14 +43,14 @@ if TYPE_CHECKING:
 
 
 class ConditionFn(Protocol):
-    def __call__(self, state: "GraphState") -> bool: ...
+    def __call__(self, state: GraphState) -> bool: ...
 
 
-def _compliance_attempt_count(state: "GraphState") -> int:
+def _compliance_attempt_count(state: GraphState) -> int:
     return sum(1 for node in state.execution_order if node.node_id == COMPLIANCE_NODE_ID)
 
 
-def _latest_compliance_verdict(state: "GraphState") -> ComplianceVerdict | None:
+def _latest_compliance_verdict(state: GraphState) -> ComplianceVerdict | None:
     node_result = state.results.get(COMPLIANCE_NODE_ID)
     if node_result is None:
         return None
@@ -71,7 +71,7 @@ def build_routing_conditions(max_attempts: int) -> tuple[ConditionFn, ConditionF
     status as the safe-escalation branch).
     """
 
-    def needs_revision(state: "GraphState") -> bool:
+    def needs_revision(state: GraphState) -> bool:
         attempts = _compliance_attempt_count(state)
         if attempts == 0:
             # compliance_check has not judged anything yet - nothing to revise.
@@ -81,7 +81,7 @@ def build_routing_conditions(max_attempts: int) -> tuple[ConditionFn, ConditionF
         verdict = _latest_compliance_verdict(state)
         return verdict is None or verdict.status == "REJECTED"
 
-    def ready_to_synthesize(state: "GraphState") -> bool:
+    def ready_to_synthesize(state: GraphState) -> bool:
         if _compliance_attempt_count(state) == 0:
             # compliance_check has not judged anything yet - nothing to synthesize.
             return False
