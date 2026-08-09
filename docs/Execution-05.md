@@ -484,8 +484,21 @@ index modules — a fresh environment's first-ever destroy should complete clean
 
 This is new this phase. Once `dev` is deployed (Part B), the same infrastructure now supports a
 second way for the agents to reach quant/qual data: through the real AgentCore Gateway (MCP over
-SigV4) instead of in-process Python calls. It is **off by default** — nothing in Part B changes
-behavior on its own.
+SigV4) instead of in-process Python calls. `Settings.tool_backend` is **off by default**
+(`in_process`) everywhere - it's a pure opt-in, per-process setting. **Unlike its own
+default-off stance elsewhere, dev's deployed Runtime does set `TOOL_BACKEND=gateway`** as of
+2026-08-09 (`environments/dev/main.tf`'s `agentcore_runtime` module - a deliberate deviation, same
+rationale as `MEMORY_BACKEND` in Part D: this is what makes the deployed Runtime exercise the real
+Gateway/Lambda path on every invocation, not just under the applier's own admin credentials).
+staging/prod remain opt-in-only until their own first rollout.
+
+**Live proof (2026-08-09)**: a real `invoke_agent_runtime` call (the INC2 query) returned
+`succeeded=true, escalated=false, compliance_attempts=1` with correct NAV/Beta/etc. and grounded
+commentary. CloudWatch confirmed both Lambdas actually fired for that exact call -
+`gateway_tool_invocation tool_name=quant-tools event={'ticker': 'INC2'}` and
+`gateway_tool_invocation tool_name=qual-tools event={'query': 'Fixed Income Core Bond Fund (INC2)
+macroeconomic strategy'}` - not a silent in-process fallback producing a coincidentally-correct
+answer.
 
 ### C1. What got deployed automatically in Part B
 
@@ -500,10 +513,14 @@ Terraform apply:
 - Two new IAM grants: the Runtime's role can now call `bedrock-agentcore:InvokeGateway` on the
   Gateway; the qual Lambda's execution role can now call `bedrock-agent-runtime:Retrieve` on the
   Knowledge Base.
+- `TOOL_BACKEND = "gateway"` and `GATEWAY_URL = module.agentcore_gateway.gateway_url` in the
+  deployed Runtime's `environment_variables` - dev's Runtime has Gateway routing on by default
+  (see the note above this section for why).
 
-### C2. Turn it on for a given run
+### C2. Turn it on for a local run
 
-Set two settings — either as process environment variables, or in `environments/.env.<env>`:
+Dev's deployed Runtime already has this on (see C1) — nothing to configure there. For a **local**
+CLI/API/runtime-entrypoint process pointed at the real deployed Gateway instead:
 
 ```powershell
 $env:TOOL_BACKEND = "gateway"
@@ -515,18 +532,10 @@ cd infra/terraform/environments/dev
 terraform output gateway_url
 ```
 
-For the **deployed Runtime container**, this needs to be set the same way `MODEL_PROVIDER`/
-`DATA_BACKEND` overrides are today — as an `environment_variables` entry in
-`environments/dev/main.tf`'s `agentcore_runtime` module (`TOOL_BACKEND = "gateway"`,
-`GATEWAY_URL = module.agentcore_gateway.gateway_url` — the latter is actually already wired in;
-only `TOOL_BACKEND` needs adding if you want the *deployed* Runtime to default to Gateway-routed
-tools rather than opting in per-local-run).
-
-For a **local process** (CLI/API/runtime-entrypoint smoke test) pointed at the real deployed
-Gateway, you additionally need real AWS credentials active (`aws configure` / an SSO login) with
-permission to call `bedrock-agentcore:InvokeGateway` on that Gateway's ARN — the same credentials
-you used for `terraform apply` already have this via the applier-ARN grant, or use the
-`deploy-dev` CI role's permissions as a reference for what a narrower principal needs.
+You additionally need real AWS credentials active (`aws configure` / an SSO login) with permission
+to call `bedrock-agentcore:InvokeGateway` on that Gateway's ARN — the same credentials you used for
+`terraform apply` already have this via the applier-ARN grant, or use the `deploy-dev` CI role's
+permissions as a reference for what a narrower principal needs.
 
 ```powershell
 uv run python -m amc_orchestrator.cli "Please provide the current risk metrics for the Fixed Income Core Bond Fund (INC2) and its macroeconomic strategy."
@@ -562,14 +571,17 @@ $env:GATEWAY_URL = "<gateway_url from C2>"
 uv run python -m pytest tests/integration/test_gateway_routed_graph.py -m integration -q
 ```
 
-### C5. Known open item
+### C5. Event payload shape (resolved 2026-08-09)
 
 The exact shape of the `event` payload the Gateway/MCP layer hands to the Lambda (flat top-level
-keys vs. nested under `input`/`arguments`) was not confirmed by static research alone —
-`handler.py` parses defensively (checks both shapes) and logs the raw event on every invocation so
-the real shape can be read from CloudWatch on the first live call and the parsing tightened if
-needed. If a Gateway-routed query returns an "Unrecognized" or missing-argument error, check the
-Lambda's CloudWatch log for the logged raw event first.
+keys vs. nested under `input`/`arguments`) was originally unconfirmed by static research alone -
+`handler.py` parses defensively (checks both shapes) and logs the raw event on every invocation.
+**Confirmed flat via real CloudWatch logs from a live invocation**: `event={'ticker': 'INC2'}` for
+quant-tools, `event={'query': '...'}` for qual-tools - top-level keys, not nested under
+`input`/`arguments`. The defensive parsing in `handler.py` is left as-is (harmless, and a real
+safety net if the Gateway's payload shape ever changes) rather than trimmed down to the
+now-confirmed shape. If a Gateway-routed query ever returns an "Unrecognized" or missing-argument
+error in the future, check the Lambda's CloudWatch log for the logged raw event first.
 
 ## Part D — AgentCore Memory (WS9)
 

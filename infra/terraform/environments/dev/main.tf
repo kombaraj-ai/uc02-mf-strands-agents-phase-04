@@ -364,12 +364,17 @@ module "agentcore_runtime" {
     OPENSEARCH_COLLECTION_ENDPOINT = module.opensearch_serverless.collection_endpoint
     BEDROCK_KNOWLEDGE_BASE_ID      = var.enable_knowledge_base ? module.knowledge_base[0].knowledge_base_id : ""
     GATEWAY_URL                    = module.agentcore_gateway.gateway_url
-    MEMORY_ID                      = module.agentcore_memory.memory_id
+    # WS8: GATEWAY_URL alone is inert (Settings.tool_backend defaults
+    # "in_process") - dev opts in here so the deployed Runtime exercises the
+    # real Gateway/Lambda path on every invocation, same rationale as
+    # MEMORY_BACKEND below. staging/prod remain opt-in-only, unchanged.
+    TOOL_BACKEND = "gateway"
+    MEMORY_ID    = module.agentcore_memory.memory_id
     # WS9: MEMORY_ID alone is inert (Settings.memory_backend defaults
-    # "disabled", same pure-opt-in pattern as TOOL_BACKEND) - dev opts in
-    # here so the deployed Runtime exercises real AgentCore Memory
-    # read/write on every invocation, needed to live-verify the new IAM
-    # grant actually works as the runtime role (not just under admin
+    # "disabled", same pure-opt-in pattern TOOL_BACKEND used to follow) -
+    # dev opts in here so the deployed Runtime exercises real AgentCore
+    # Memory read/write on every invocation, needed to live-verify the new
+    # IAM grant actually works as the runtime role (not just under admin
     # credentials, which would pass regardless of whether the grant is
     # correctly scoped).
     MEMORY_BACKEND   = "agentcore"
