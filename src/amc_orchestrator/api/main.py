@@ -2,7 +2,7 @@
 
 Startup uses `lifespan` (the current FastAPI/Starlette API) rather than the
 deprecated `@app.on_event("startup")` seen in the original brainstorm doc -
-see CLAUDE.md "API gotchas".
+see CLAUDE.md "API gotchas"..
 """
 
 from __future__ import annotations

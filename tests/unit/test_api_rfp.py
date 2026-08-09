@@ -4,7 +4,7 @@ Patches `build_rfp_graph` with a fake callable so this exercises FastAPI
 request/response wiring and the try/except-around-`graph(...)` safety net
 (mirroring `cli.py` - see CLAUDE.md "Bug #2") without needing a real Ollama
 server. Fake `GraphResult`/`NodeResult` stand-ins follow the same duck-typing
-approach as `tests/unit/test_routing.py`.
+approach as `tests/unit/test_routing.py`..
 """
 
 from __future__ import annotations

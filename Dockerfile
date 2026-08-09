@@ -4,7 +4,7 @@
 # requirement, not a preference (confirmed against Strands' own AgentCore
 # deployment guide). Build/push is a manual or CI step, deliberately never
 # done by Terraform - see infra/terraform/README.md's "Pass 3" section for
-# the exact commands and why.
+# the exact commands and why..
 #
 # Build:  docker build --platform linux/arm64 -t <ecr_repository_url>:<tag> .
 FROM --platform=linux/arm64 ghcr.io/astral-sh/uv:python3.12-bookworm-slim
