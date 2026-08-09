@@ -420,8 +420,41 @@ resp = client.invoke_agent_runtime(
 print(resp["response"].read().decode("utf-8"))
 ```
 
-Or use the Streamlit UI (Part A4) with **Target = Deployed AgentCore Runtime (AWS)**, or the AWS
-Console's Bedrock → AgentCore → Runtimes → your runtime → **Test** tab.
+Or use the AWS Console's Bedrock → AgentCore → Runtimes → your runtime → **Test** tab, or the
+Streamlit UI - see B8b below for the full steps, since Part A4 only mentions that mode exists
+without walking through it.
+
+### B8b. Access it via the Streamlit UI
+
+Part A4 already covers launching the UI itself; this is specifically about pointing it at the
+*deployed* Runtime instead of a local API server.
+
+```powershell
+uv sync --group ui
+uv run streamlit run src/amc_orchestrator/ui/streamlit_app.py
+```
+
+Opens at `http://localhost:8501`.
+
+1. **Sidebar → "Target"** → switch from "Local API server" to **"Deployed AgentCore Runtime
+   (AWS)"**.
+2. Fill in the two fields that appear:
+   - **AWS region** - e.g. `us-east-1`
+   - **Agent Runtime ARN** - from `terraform output -raw agent_runtime_arn` in
+     `infra/terraform/environments/<env>` (after pass 3)
+   No separate login - it uses whatever AWS credentials are already active locally (the same ones
+   used for `terraform apply`; `aws sts get-caller-identity` to confirm).
+3. Click **"Refresh status"** - the sidebar should show a green **"Runtime READY"** badge.
+   Expand "Backend configuration (from deployed Runtime)" to see the real, Terraform-applied env
+   vars for this specific Runtime (`MODEL_PROVIDER`, `TOOL_BACKEND`, `MEMORY_BACKEND`, etc.) -
+   confirms you're reading the deployed container's actual config, not a local guess.
+4. Submit a query (an example from the dropdown, or custom text) - renders the same
+   response/compliance-attempt/elapsed-time view as local mode.
+5. Optional: sidebar **"Session continuity (AgentCore Memory)"** checkbox reuses the same session
+   ID across requests to demonstrate WS9's cross-turn memory (needs a session id
+   `>= 33` characters - AWS's own `runtimeSessionId` constraint; the "New session ID" button
+   generates a valid one). Only has an effect if the connected Runtime has
+   `MEMORY_BACKEND=agentcore` active - check the backend configuration expander from step 3 first.
 
 ### B9. Staging, then prod (deferred in this phase)
 
