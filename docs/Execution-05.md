@@ -184,8 +184,13 @@ Invoke-RestMethod -Method Post -Uri http://localhost:8000/api/v1/rfp `
 
 ```powershell
 uv sync --group ui
-uv run streamlit run src/amc_orchestrator/ui/streamlit_app.py
+uv run python -m streamlit run src/amc_orchestrator/ui/streamlit_app.py
 ```
+
+> **Use `uv run python -m streamlit`, not `uv run streamlit`.** Same launcher quirk as A5's pytest
+> note - on a machine where this repo's path contains spaces, the bare `streamlit` console-script
+> launcher fails with `Failed to canonicalize script path` before even reaching the app.
+> `uv run python -m streamlit run ...` does not have this problem.
 
 Opens at `http://localhost:8501`. Sidebar **Target** switches between **Local API server** (needs
 A3's server running) and **Deployed AgentCore Runtime (AWS)** (needs Part B/C below — no local
@@ -431,10 +436,11 @@ Part A4 already covers launching the UI itself; this is specifically about point
 
 ```powershell
 uv sync --group ui
-uv run streamlit run src/amc_orchestrator/ui/streamlit_app.py
+uv run python -m streamlit run src/amc_orchestrator/ui/streamlit_app.py
 ```
 
-Opens at `http://localhost:8501`.
+Opens at `http://localhost:8501`. (See A4's note above if `streamlit` alone fails with
+`Failed to canonicalize script path`.)
 
 1. **Sidebar → "Target"** → switch from "Local API server" to **"Deployed AgentCore Runtime
    (AWS)"**.
