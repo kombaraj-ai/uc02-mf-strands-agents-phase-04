@@ -471,12 +471,32 @@ Not part of this phase's scope — [`ci_cd_runbook.md`](ci_cd_runbook.md#4-stagi
 
 ```powershell
 cd infra/terraform/environments/dev   # or staging / prod
-terraform destroy
+terraform destroy -var="container_image_uri=unused-for-destroy"
 ```
 
 `force_delete`/`force_destroy` are already set on the ECR repo, S3 docs bucket, and OpenSearch
 index modules — a fresh environment's first-ever destroy should complete cleanly
 (`0 added, 0 changed, N destroyed`). Confirm with `terraform state list` (empty = fully torn down).
+
+**Why `-var="container_image_uri=..."` is required even for destroy**: `terraform.tfvars` deliberately
+ships `container_image_uri = ""` (see B6 — it's meant to be supplied via `-var` at apply time, never
+committed for real), and `modules/agentcore-runtime/variables.tf`'s `validation` block rejects an empty
+string. Terraform evaluates variable `validation` blocks on *every* operation, including `destroy`/
+`plan -destroy`, not just `apply` — so a plain `terraform destroy` fails before it ever gets to planning
+the teardown:
+
+```
+Error: Invalid value for variable
+   on main.tf line 341, in module "agentcore_runtime":
+  341:   container_image_uri = var.container_image_uri
+ var.container_image_uri is ""
+ container_image_uri must be set to a real, already-pushed ECR image URI
+```
+
+The value itself is inert for a destroy — nothing gets built or read from it, it only needs to satisfy
+the validation check — so any non-empty placeholder works. Confirmed via a real `terraform plan -destroy`
+against a live dev environment: `Plan: 0 to add, 0 to change, 51 to destroy`, no drift from the dummy
+value.
 
 ---
 
